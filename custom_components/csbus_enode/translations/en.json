@@ -1,0 +1,41 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Connect to Converging Systems e-Node",
+        "description": "Enter the network settings for your e-Node gateway.\n\n**Tip:** Use a static IP so the address never changes. Default Telnet port is 23.",
+        "data": {
+          "host": "e-Node IP Address",
+          "name": "Gateway Name (optional)",
+          "port": "Telnet Port",
+          "username": "Telnet Username",
+          "password": "Telnet Password"
+        },
+        "data_description": {
+          "host": "The IP address of your e-Node on the local network",
+          "username": "Default is 'Telnet 1' (e-Node MKIII and later)",
+          "password": "Default is 'Password 1' (e-Node MKIII and later)"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Could not connect to the e-Node. Check the IP address, port, and that the device is powered on.",
+      "unknown": "An unexpected error occurred. Check your Home Assistant logs for details."
+    },
+    "abort": {
+      "already_configured": "This e-Node gateway is already configured."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "e-Node Options",
+        "description": "Adjust polling and transition behavior.",
+        "data": {
+          "scan_interval": "State poll interval (seconds)",
+          "default_transition": "Default light transition time (seconds)"
+        }
+      }
+    }
+  }
+}

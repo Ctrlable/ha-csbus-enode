@@ -1,0 +1,126 @@
+csbus_recall_preset:
+  name: Recall Preset
+  description: >
+    Recalls a previously stored lighting or motor position preset (1–24).
+    For motor/shade devices, preset 0 moves to the home position.
+  target:
+    entity:
+      domain:
+        - light
+        - cover
+  fields:
+    preset:
+      name: Preset Number
+      description: Preset slot to recall (0–24). Preset 0 is the home position for motors.
+      required: true
+      selector:
+        number:
+          min: 0
+          max: 24
+          mode: box
+    transition:
+      name: Transition Time (seconds)
+      description: Optional fade/ramp time in seconds (lighting only).
+      required: false
+      selector:
+        number:
+          min: 0
+          max: 64800
+          unit_of_measurement: s
+
+csbus_store_preset:
+  name: Store Preset
+  description: >
+    Saves the current lighting color/brightness or motor position into a preset slot.
+  target:
+    entity:
+      domain:
+        - light
+        - cover
+  fields:
+    preset:
+      name: Preset Number
+      description: Preset slot to save into (1–24).
+      required: true
+      selector:
+        number:
+          min: 1
+          max: 24
+          mode: box
+
+csbus_set_circadian:
+  name: Set Circadian Level
+  description: >
+    Sets the circadian (biological) lighting level. 0 = nighttime, 240 = noon-day sun.
+    Only applicable to ILC controllers with circadian support.
+  target:
+    entity:
+      domain: light
+  fields:
+    level:
+      name: Level
+      description: Circadian level (0–240).
+      required: true
+      selector:
+        number:
+          min: 0
+          max: 240
+          mode: slider
+    transition:
+      name: Transition Time (seconds)
+      description: Optional ramp time.
+      required: false
+      selector:
+        number:
+          min: 0
+          max: 64800
+          unit_of_measurement: s
+
+csbus_resume_circadian:
+  name: Resume Circadian Schedule
+  description: >
+    Resumes a previously interrupted circadian lighting sequence.
+  target:
+    entity:
+      domain: light
+  fields:
+    max_level:
+      name: Maximum Level at Noon
+      description: Peak brightness level (0–240, default 240).
+      required: false
+      default: 240
+      selector:
+        number:
+          min: 0
+          max: 240
+          mode: slider
+
+csbus_set_dissolve:
+  name: Set Dissolve Rate
+  description: >
+    Sets the dissolve (fade) rate for a lighting controller.
+    Index 1 = direct value changes; Index 2 = ON/OFF and preset transitions;
+    Index 3 = Effect 1 and 4; Index 4 = Effect 3 cycle time.
+    Index 0 changes all simultaneously.
+  target:
+    entity:
+      domain: light
+  fields:
+    dissolve_index:
+      name: Dissolve Index
+      description: Which dissolve setting to change (0–4).
+      required: true
+      selector:
+        number:
+          min: 0
+          max: 4
+          mode: box
+    seconds:
+      name: Seconds
+      description: Transition duration in seconds.
+      required: true
+      selector:
+        number:
+          min: 0
+          max: 240
+          unit_of_measurement: s
