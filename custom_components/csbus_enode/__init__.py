@@ -144,8 +144,15 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         host, len(devices), n_lights, n_covers,
     )
 
-    # Clamp scan_interval based on the bus types present
+    # Determine bus types present across all devices.
     bus_types = {d.get("bus_type", "I") for d in devices}
+
+    # Enable NOTIFY push only for CS-Bus devices.  DMX is explicitly excluded:
+    # enabling NOTIFY on a DMX gateway causes a message storm (up to 44 Hz ×
+    # all fixtures) that overflows the e-Node firmware and takes it offline.
+    await client.async_enable_notify(bus_types)
+
+    # Clamp scan_interval based on bus types present.
     if BUS_DMX in bus_types:
         scan_interval = max(scan_interval, MIN_SCAN_INTERVAL_DMX)
     if BUS_DALI in bus_types:
