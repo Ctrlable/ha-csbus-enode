@@ -42,32 +42,25 @@ async_discover detects a quick !DONE,0 (< DISCOVER_QUICK_DONE_THRESHOLD)
 and skips further retries when the bus fault pattern is recognised, rather
 than waiting through the full retry cycle.
 
-DMX — NOTIFY is FATAL, wildcard queries cause response floods
---------------------------------------------------------------
-DMX buses refresh at up to 44 Hz.  Sending the wildcard NOTIFY enable
+DMX — NOTIFY and wildcard queries are FATAL
+--------------------------------------------
+DMX buses refresh at up to 44 Hz.  The wildcard NOTIFY enable
   #0.0.0.LED.NOTIFY=VALUE;\r\n
-on a DMX gateway causes the e-Node to push a VALUE message for every channel
-state change on every fixture — potentially hundreds per second.  This
-overflows the e-Node's TCP output buffer and crashes the firmware (gateway
-goes completely offline).
+causes the e-Node to push a VALUE message for every channel change on every
+fixture — potentially hundreds per second — overflowing its TCP output buffer
+and crashing the firmware (gateway goes completely offline).
 
-The wildcard keepalive query  #0.0.0.LED.VALUE=?;\r\n  is equally dangerous:
-it causes all DMX fixtures to respond simultaneously, producing a burst of up
-to 32 responses every KEEPALIVE_INTERVAL seconds.
+Wildcard queries (0.0.0 ZGN) are equally dangerous: they cause all DMX
+fixtures to respond simultaneously.
 
-Fixes applied:
-  - NOTIFY is NEVER enabled for DMX buses (async_enable_notify filters BUS_DMX)
-  - The keepalive no longer sends any bus query; it uses TCP SO_KEEPALIVE plus
-    a blank application-level write so the OS and Telnet server both see traffic
+NOTIFY is therefore NEVER enabled by this client.  Wildcard commands and
+queries (ZGN containing "0.0.0") are blocked in async_send_command,
+async_send_item_command, and async_query.
 
 DALI state feedback
 --------------------
-This firmware does NOT send NOTIFY push for DALI buses.  DALI query responses
-(#Z.G.N.LED.VALUE=?  →  #Z.G.N.LED.VALUE=?) echo the query back as a '#'
-message, not a '!' push, so async_query always times out.  NOTIFY is also not
-sent for DALI (no benefit, saves a round-trip).
-
-The only real-time feedback available for DALI is the command echo:
+This firmware does NOT send NOTIFY push for DALI buses.  The only real-time
+feedback available is the command echo:
   #Z.G.N.LED=ON(TELNET)  /  #Z.G.N.LED=OFF(TELNET)
 produced when a specific node (non-wildcard) executes the command.
 ENodeCoordinator.handle_notify parses these for ON/OFF state.
@@ -85,7 +78,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
-import socket
 from typing import Any, Callable
 
 _LOGGER = logging.getLogger(__name__)
@@ -93,9 +85,9 @@ _LOGGER = logging.getLogger(__name__)
 TELNET_PORT = 23
 CONNECT_TIMEOUT = 10.0
 COMMAND_TIMEOUT = 5.0
-KEEPALIVE_INTERVAL = 45.0
-RECONNECT_DELAY = 5.0
-DISCOVER_TIMEOUT = 30.0        # DALI buses can be slow — live test showed 16 s response time
+KEEPALIVE_INTERVAL = 30.0
+RECONNECT_DELAY = 10.0
+DISCOVER_TIMEOUT = 25.0        # DALI buses can be slow — live test showed 16 s response time
 DISCOVER_QUICK_DONE_THRESHOLD = 2.0  # !DONE,0 within this many seconds → likely bus fault, not race
 
 # Bus type constants (FORM field position 1)
@@ -185,14 +177,12 @@ class ENodeClient:
         self._reader: asyncio.StreamReader | None = None
         self._writer: asyncio.StreamWriter | None = None
         self._connected = False
+        self._reconnecting = False
         self._listeners: list[Callable[[str], None]] = []
         self._recv_task: asyncio.Task | None = None
         self._keepalive_task: asyncio.Task | None = None
         self._lock = asyncio.Lock()
         self._firmware_year: str = ""
-        # Bus types for which NOTIFY push is safe to enable.
-        # Set by async_enable_notify(); never includes BUS_DMX.
-        self._notify_bus_types: set[str] = set()
 
     # ------------------------------------------------------------------
     # Public API
@@ -208,66 +198,24 @@ class ENodeClient:
                 pass
         return _remove
 
-    async def async_enable_notify(self, bus_types: set[str]) -> None:
-        """
-        Enable NOTIFY push for the detected bus types.
-
-        Call this once after device discovery so the correct bus types are known.
-
-        CRITICAL — BUS_DMX is always excluded:
-          DMX buses refresh at up to 44 Hz.  Enabling the wildcard NOTIFY on a
-          DMX gateway causes the e-Node to push a VALUE message for every channel
-          change on every fixture — potentially hundreds per second — which
-          overflows its TCP output buffer and crashes the firmware (gateway goes
-          completely offline).
-
-        BUS_DALI is also excluded: this firmware ignores the NOTIFY command for
-        DALI buses so sending it provides no benefit.
-
-        The filtered set is stored so _reconnect can re-enable after a TCP drop.
-        """
-        self._notify_bus_types = {bt for bt in bus_types if bt == BUS_CSBUS}
-        if self._notify_bus_types:
-            await self._send_notify_commands()
-        else:
-            _LOGGER.debug(
-                "e-Node %s: NOTIFY not enabled (no CS-Bus devices or DMX-only gateway)",
-                self.host,
-            )
-
-    async def _send_notify_commands(self) -> None:
-        """Send the NOTIFY enable commands for CS-Bus devices."""
-        await self._send_raw("#0.0.0.LED.NOTIFY=VALUE;\r\n")
-        await self._send_raw("#0.0.0.MOTOR.NOTIFY=ON;\r\n")
-
     async def async_connect(self) -> bool:
         """Open Telnet connection and authenticate. Returns True on success."""
+        if self._connected:
+            return True
         try:
             _LOGGER.debug("Connecting to e-Node %s:%s", self.host, self.port)
             self._reader, self._writer = await asyncio.wait_for(
                 asyncio.open_connection(self.host, self.port),
                 timeout=CONNECT_TIMEOUT,
             )
-            # Enable TCP keepalive at the OS level so dead connections are
-            # detected without sending any bus traffic.
-            sock = self._writer.get_extra_info("socket")
-            if sock is not None:
-                sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-
             await self._authenticate()
             self._connected = True
             self._recv_task = asyncio.create_task(
-                self._receive_loop(), name="enode_recv"
+                self._receive_loop(), name=f"enode_recv_{self.host}"
             )
             self._keepalive_task = asyncio.create_task(
-                self._keepalive_loop(), name="enode_keepalive"
+                self._keepalive_loop(), name=f"enode_keepalive_{self.host}"
             )
-            # NOTIFY is set up by async_enable_notify() after device discovery
-            # because bus type determines whether it is safe to enable.
-            # It must NEVER be sent here for DMX gateways — see module docstring.
-            # Re-enable for already-known bus types on reconnect.
-            if self._notify_bus_types:
-                await self._send_notify_commands()
             _LOGGER.info("e-Node connected at %s (firmware year: %s)",
                          self.host, self._firmware_year or "unknown")
             return True
@@ -282,6 +230,10 @@ class ENodeClient:
         for task in (self._recv_task, self._keepalive_task):
             if task and not task.done():
                 task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
         if self._writer:
             try:
                 self._writer.close()
@@ -297,12 +249,18 @@ class ENodeClient:
         Format:  #Z.G.N.DEVICE=COMMAND;\\r\\n
         The e-Node translates automatically for DMX and DALI fixtures.
         """
+        if "0.0.0" in zgn:
+            _LOGGER.warning("Refusing broadcast command to %s — would flood DMX/DALI gateway", zgn)
+            return False
         return await self._send_raw(f"#{zgn}.{device}={command};\r\n")
 
     async def async_send_item_command(
         self, zgn: str, device: str, item: str, value: str
     ) -> bool:
         """Send:  #Z.G.N.DEVICE.ITEM=VALUE;\\r\\n"""
+        if "0.0.0" in zgn:
+            _LOGGER.warning("Refusing broadcast item command to %s — would flood DMX/DALI gateway", zgn)
+            return False
         return await self._send_raw(f"#{zgn}.{device}.{item}={value};\r\n")
 
     async def async_query(self, zgn: str, device: str, item: str) -> str | None:
@@ -311,6 +269,9 @@ class ENodeClient:
         Sends:     #Z.G.N.DEVICE.ITEM=?;\\r\\n
         Receives:  !Z.G.N.DEVICE.ITEM=value;
         """
+        if "0.0.0" in zgn:
+            _LOGGER.warning("Refusing broadcast query to %s — would flood DMX/DALI gateway", zgn)
+            return None
         msg = f"#{zgn}.{device}.{item}=?;\r\n"
         event = asyncio.Event()
         result: list[str] = []
@@ -619,17 +580,27 @@ class ENodeClient:
 
     async def _reconnect(self) -> None:
         """Re-establish a dropped connection."""
+        if self._reconnecting:
+            return
+        self._reconnecting = True
         self._connected = False
         for task in (self._recv_task, self._keepalive_task):
             if task and not task.done():
                 task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
         if self._writer:
             try:
                 self._writer.close()
             except Exception:
                 pass
+        self._writer = None
+        self._reader = None
         _LOGGER.info("e-Node: reconnecting in %ss…", RECONNECT_DELAY)
         await asyncio.sleep(RECONNECT_DELAY)
+        self._reconnecting = False
         await self.async_connect()
 
 

@@ -30,17 +30,22 @@ the DALI bus recovers, with no HA restart required.
 
 State updates — per bus type
 -----------------------------
-CS-Bus / DMX:
-  NOTIFY push is the primary mechanism — the e-Node broadcasts
-  !Z.G.N.LED.VALUE / !Z.G.N.LED.COLOR messages after every command.
-  Staggered polling is the fallback.
+CS-Bus:
+  NOTIFY push is available — the e-Node broadcasts !Z.G.N.LED.VALUE /
+  !Z.G.N.LED.COLOR messages after every command.  Staggered polling is
+  the fallback.  NOTIFY is NOT enabled by this component (enode_client
+  never sends the wildcard NOTIFY enable) to keep the code safe across
+  all gateway types.
+
+DMX:
+  NOTIFY is never enabled — it would flood the gateway at 44 Hz per
+  fixture and crash the firmware.  Staggered polling is the only
+  mechanism, clamped to MIN_SCAN_INTERVAL_DMX.
 
 DALI (this installation):
-  The e-Node firmware does NOT send NOTIFY push for DALI buses — the
-  wildcard NOTIFY enable (#0.0.0.LED.NOTIFY=VALUE) is sent on connect
-  but produces no unsolicited responses.  DALI query responses also echo
-  back as '#' messages (not '!' push), so async_query always times out.
-  State is maintained exclusively through:
+  The e-Node firmware does NOT send NOTIFY push for DALI buses.  DALI
+  query responses echo back as '#' messages (not '!' push), so
+  async_query always times out.  State is maintained exclusively through:
     1. Optimistic updates written immediately after each command.
     2. Command echoes: #Z.G.N.LED=ON(TELNET) / OFF(TELNET) parsed by
        handle_notify to confirm ON/OFF transitions.
@@ -146,11 +151,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     # Determine bus types present across all devices.
     bus_types = {d.get("bus_type", "I") for d in devices}
-
-    # Enable NOTIFY push only for CS-Bus devices.  DMX is explicitly excluded:
-    # enabling NOTIFY on a DMX gateway causes a message storm (up to 44 Hz ×
-    # all fixtures) that overflows the e-Node firmware and takes it offline.
-    await client.async_enable_notify(bus_types)
 
     # Clamp scan_interval based on bus types present.
     if BUS_DMX in bus_types:
