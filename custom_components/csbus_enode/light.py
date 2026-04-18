@@ -176,6 +176,11 @@ class CSBusLight(CoordinatorEntity, LightEntity):  # type: ignore[misc]
         raw: int | None = cast("int | None", state.get("v") or state.get("brightness_raw"))
         if raw is not None:
             return _cs_to_ha(raw)
+        # Bi-white CCT device: derive brightness from max of warm/cool channels
+        warm = state.get("warm")
+        cool = state.get("cool")
+        if warm is not None and cool is not None:
+            return _cs_to_ha(max(int(warm), int(cool)))
         return None
 
     @property
@@ -225,6 +230,11 @@ class CSBusLight(CoordinatorEntity, LightEntity):  # type: ignore[misc]
     # Commands
     # ------------------------------------------------------------------
 
+    def _push_optimistic(self, **state_fields: Any) -> None:
+        """Write state immediately so HA shows feedback before NOTIFY arrives."""
+        self.coordinator._state.setdefault(self._address, {}).update(state_fields)
+        self.coordinator.async_set_updated_data(dict(self.coordinator._state))
+
     async def async_turn_on(self, **kwargs: Any) -> None:
         transition = kwargs.get(ATTR_TRANSITION)
         ramp = f":{int(transition)}" if transition is not None else ""
@@ -234,6 +244,7 @@ class CSBusLight(CoordinatorEntity, LightEntity):  # type: ignore[misc]
             cmd = _EFFECT_MAP.get(effect_key)
             if cmd:
                 await self._client.async_send_command(self._address, CS_DEVICE_LED, cmd)
+                self._push_optimistic(is_on=True)
                 return
 
         if ATTR_HS_COLOR in kwargs:
@@ -245,6 +256,7 @@ class CSBusLight(CoordinatorEntity, LightEntity):  # type: ignore[misc]
             await self._client.async_send_command(
                 self._address, CS_DEVICE_LED, f"HSV,{h_cs}.{s_cs}.{v_cs}{ramp}"
             )
+            self._push_optimistic(is_on=v_cs > 0, h=h_cs, s=s_cs, v=v_cs)
             return
 
         if ATTR_RGB_COLOR in kwargs:
@@ -255,6 +267,8 @@ class CSBusLight(CoordinatorEntity, LightEntity):  # type: ignore[misc]
             await self._client.async_send_command(
                 self._address, CS_DEVICE_LED, f"RGB,{r_cs}.{g_cs}.{b_cs}{ramp}"
             )
+            self._push_optimistic(is_on=any(x > 0 for x in (r_cs, g_cs, b_cs)),
+                                  r=r_cs, g=g_cs, b=b_cs)
             return
 
         if ATTR_RGBW_COLOR in kwargs:
@@ -266,13 +280,20 @@ class CSBusLight(CoordinatorEntity, LightEntity):  # type: ignore[misc]
             await self._client.async_send_command(
                 self._address, CS_DEVICE_LED, f"RGBW,{r_cs}.{g_cs}.{b_cs}.{w_cs}{ramp}"
             )
+            self._push_optimistic(is_on=any(x > 0 for x in (r_cs, g_cs, b_cs, w_cs)),
+                                  r=r_cs, g=g_cs, b=b_cs, w=w_cs)
             return
 
         if ATTR_COLOR_TEMP_KELVIN in kwargs:
             cct = kwargs[ATTR_COLOR_TEMP_KELVIN]
+            brightness = kwargs.get(ATTR_BRIGHTNESS)
             await self._client.async_send_command(
                 self._address, CS_DEVICE_LED, f"CCT,{cct}{ramp}"
             )
+            upd: dict[str, Any] = {"is_on": True, "cct": cct}
+            if brightness is not None:
+                upd["brightness_raw"] = _ha_to_cs(brightness)
+            self._push_optimistic(**upd)
             return
 
         if ATTR_BRIGHTNESS in kwargs:
@@ -280,12 +301,14 @@ class CSBusLight(CoordinatorEntity, LightEntity):  # type: ignore[misc]
             await self._client.async_send_command(
                 self._address, CS_DEVICE_LED, f"SET,{level}{ramp}"
             )
+            self._push_optimistic(is_on=level > 0, brightness_raw=level)
             return
 
         # Plain ON with optional ramp
         await self._client.async_send_command(
             self._address, CS_DEVICE_LED, f"ON{ramp}"
         )
+        self._push_optimistic(is_on=True)
 
     async def async_turn_off(self, **kwargs: Any) -> None:
         transition = kwargs.get(ATTR_TRANSITION)
@@ -293,6 +316,7 @@ class CSBusLight(CoordinatorEntity, LightEntity):  # type: ignore[misc]
         await self._client.async_send_command(
             self._address, CS_DEVICE_LED, f"OFF{ramp}"
         )
+        self._push_optimistic(is_on=False)
 
     # ------------------------------------------------------------------
     # Extra service calls exposed via HA actions

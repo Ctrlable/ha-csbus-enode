@@ -300,6 +300,9 @@ class ENodeCoordinator(DataUpdateCoordinator):
                                  b=int(parts[2]), w=int(parts[3]))
                 elif len(parts) == 3:
                     state.update(r=int(parts[0]), g=int(parts[1]), b=int(parts[2]))
+                elif len(parts) == 2:
+                    # Bi-white (CCT) device: VALUE=warm_channel.cool_channel
+                    state.update(warm=int(parts[0]), cool=int(parts[1]))
                 elif len(parts) == 1:
                     state["brightness_raw"] = int(parts[0])
                 state["is_on"] = any(int(p) > 0 for p in parts)

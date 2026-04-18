@@ -1,41 +1,75 @@
-[837627.739] Connecting to 172.16.1.19:23 …
-[837627.756] TCP connected
+[838546.493] Connecting to 172.16.1.19:23 …
+[838546.511] TCP connected
 
-[837631.756] === BANNER (5 bytes) ===
+[838550.512] === BANNER (5 bytes) ===
 b'User:'
 
-[837631.756] Auth prompt detected — sending username: 'E-NODE'
-[837631.775] AFTER_USER_RX: b'Password:'
-[837631.775] TX >>> 'ADMIN'
-[837634.775] AUTH RESPONSE: b'Connected:\n\x00#1.16.0.LED.COLOR=?;\r\n'
+[838550.512] Auth prompt detected — sending username: 'E-NODE'
+[838550.527] AFTER_USER_RX: b'Password:'
+[838550.527] TX >>> 'ADMIN'
+[838553.527] AUTH RESPONSE: b'Connected:\n\x00#1.16.0.LED.COLOR=?;\r\n'
 
-[837634.775] TX >>> b'>DISCOVER\r\n'
-[837634.775] Capturing DISCOVER response for 25 s …
-[837650.986] CHUNK (105 bytes): b'!UID16.FORM=1,I,LIGHT,MONO,TRUE;\r\n!UID16.ALIAS=;\r\n!UID16.BUS.ADDRESS=1.16.0;\r\n!UID16.LED.CMS.WARM=1800;\r\n'
-[837650.995] CHUNK (36 bytes): b'!UID16.LED.CMS.COOL=4000;\r\n!DONE,0\r\n'
+[838553.527] TX >>> b'>DISCOVER\r\n'
+[838553.527] Capturing DISCOVER response for 25 s …
+[838558.549] CHUNK (9 bytes): b'!DONE,0\r\n'
+[838572.246] CHUNK (9 bytes): b'!DONE,0\r\n'
 
-[837659.776] === FULL DISCOVER BUFFER (141 bytes) ===
-b'!UID16.FORM=1,I,LIGHT,MONO,TRUE;\r\n!UID16.ALIAS=;\r\n!UID16.BUS.ADDRESS=1.16.0;\r\n!UID16.LED.CMS.WARM=1800;\r\n!UID16.LED.CMS.COOL=4000;\r\n!DONE,0\r\n'
+[838578.528] === FULL DISCOVER BUFFER (18 bytes) ===
+b'!DONE,0\r\n!DONE,0\r\n'
 
-[837659.776] === DISCOVER LINE-BY-LINE ===
-  line 000: b'!UID16.FORM=1,I,LIGHT,MONO,TRUE;\r'
-  line 001: b'!UID16.ALIAS=;\r'
-  line 002: b'!UID16.BUS.ADDRESS=1.16.0;\r'
-  line 003: b'!UID16.LED.CMS.WARM=1800;\r'
-  line 004: b'!UID16.LED.CMS.COOL=4000;\r'
-  line 005: b'!DONE,0\r'
-  line 006: b''
+[838578.528] === DISCOVER LINE-BY-LINE ===
+  line 000: b'!DONE,0\r'
+  line 001: b'!DONE,0\r'
+  line 002: b''
 
-[837659.776] === MANUAL COMMAND TESTS ===
-[837659.776] TX >>> b'#2.1.1.LED=ON;\r\n'
-[837661.276] RX <<< b'#2.1.1.LED=ON(TELNET);\r\n'
-[837661.576] TX >>> b'#2.1.1.LED.VALUE=120;\r\n'
-[837663.077] RX <<< b'#2.1.1.LED.VALUE=120;\r\n'
-[837663.378] TX >>> b'#2.1.1.LED=OFF;\r\n'
-[837664.878] RX <<< b'#2.1.1.LED=OFF(TELNET);\r\n#0.0.0.LED.VALUE=?;\r\n'
-[837665.178] TX >>> b'#2.1.0.LED=ON;\r\n'
-[837666.679] RX <<< b'#2.1.0.LED=ON(TELNET);\r\n'
-[837666.979] TX >>> b'#2.1.0.LED=OFF;\r\n'
-[837668.480] RX <<< b'#2.1.0.LED=OFF(TELNET);\r\n'
+[838578.528] === ENABLING NOTIFY ===
+[838578.529] TX >>> b'#0.0.0.LED.NOTIFY=VALUE;\r\n'
+[838580.029] NOTIFY RX: b''
+[838580.329] TX >>> b'#0.0.0.MOTOR.NOTIFY=ON;\r\n'
+[838581.830] NOTIFY RX: b''
 
-[837668.780] Done.
+[838582.130] === MANUAL COMMAND TESTS ===
+[838582.130] [ILC-DALI ON] TX >>> b'#1.16.0.LED=ON;\r\n'
+[838584.631] [ILC-DALI ON] RX <<< b''
+[838584.932] [ILC-DALI OFF] TX >>> b'#1.16.0.LED=OFF;\r\n'
+[838587.432] [ILC-DALI OFF] RX <<< b'!DONE,0\r\n'
+[838587.732] [VALUE=120] TX >>> b'#1.16.0.LED.VALUE=120;\r\n'
+[838590.233] [VALUE=120] RX <<< b'#1.16.0.LED.COLOR=?;\r\n#1.16.0.LED.VALUE=120;\r\n'
+[838590.533] [VALUE=?] TX >>> b'#1.16.0.LED.VALUE=?;\r\n'
+[838593.033] [VALUE=?] RX <<< b'#1.16.0.LED.VALUE=?;\r\n'
+[838593.334] [SUN=120] TX >>> b'#1.16.0.LED.SUN=120;\r\n'
+[838595.834] [SUN=120] RX <<< b'#1.16.0.LED.SUN=120;\r\n'
+[838596.134] [SUN=?] TX >>> b'#1.16.0.LED.SUN=?;\r\n'
+[838598.635] [SUN=?] RX <<< b'!DONE,0\r\n'
+[838598.936] [CCT=3000] TX >>> b'#1.16.0.LED.CCT=3000;\r\n'
+[838601.437] [CCT=3000] RX <<< b'#1.16.0.LED.CCT=3000;\r\n#0.0.0.LED.VALUE=?;\r\n'
+[838601.737] [CCT=?] TX >>> b'#1.16.0.LED.CCT=?;\r\n'
+[838604.238] [CCT=?] RX <<< b'#1.16.0.LED.CCT=?;\r\n'
+[838604.539] [SET=120,60] TX >>> b'#1.16.0.LED.SET=120,60;\r\n'
+[838607.039] [SET=120,60] RX <<< b'*;\r\n'
+[838607.340] [SET=120,60 ?] TX >>> b'#1.16.0.LED.SET=?;\r\n'
+[838609.840] [SET=120,60 ?] RX <<< b''
+[838610.141] [STATUS=?] TX >>> b'#1.16.0.LED.STATUS=?;\r\n'
+[838612.641] [STATUS=?] RX <<< b'!DONE,0\r\n#1.16.0.LED.STATUS=?;\r\n'
+[838612.942] [node1 ON] TX >>> b'#1.16.1.LED=ON;\r\n'
+[838615.443] [node1 ON] RX <<< b'#1.16.1.LED=ON(TELNET);\r\n'
+[838615.744] [node1 VALUE=120] TX >>> b'#1.16.1.LED.VALUE=120;\r\n'
+[838618.244] [node1 VALUE=120] RX <<< b'#1.16.1.LED.VALUE=120;\r\n'
+[838618.545] [node1 VALUE=?] TX >>> b'#1.16.1.LED.VALUE=?;\r\n'
+[838621.046] [node1 VALUE=?] RX <<< b'#1.16.1.LED.VALUE=?;\r\n'
+[838621.347] [node1 SUN=120] TX >>> b'#1.16.1.LED.SUN=120;\r\n'
+[838623.847] [node1 SUN=120] RX <<< b'#1.16.1.LED.SUN=120;\r\n#1.16.0.LED.COLOR=?;\r\n'
+[838624.148] [node1 OFF] TX >>> b'#1.16.1.LED=OFF;\r\n'
+[838626.649] [node1 OFF] RX <<< b'#1.16.1.LED=OFF(TELNET);\r\n'
+[838626.949] [node2 ON] TX >>> b'#1.16.2.LED=ON;\r\n'
+[838629.449] [node2 ON] RX <<< b'#1.16.2.LED=ON(TELNET);\r\n'
+[838629.749] [node2 OFF] TX >>> b'#1.16.2.LED=OFF;\r\n'
+[838632.250] [node2 OFF] RX <<< b'#1.16.2.LED=OFF(TELNET);\r\n'
+[838632.551] [node14 ON] TX >>> b'#1.16.14.LED=ON;\r\n'
+[838635.051] [node14 ON] RX <<< b'#1.16.14.LED=ON(TELNET);\r\n'
+[838635.351] [node14 OFF] TX >>> b'#1.16.14.LED=OFF;\r\n'
+[838637.852] [node14 OFF] RX <<< b'#1.16.14.LED=OFF(TELNET);\r\n'
+[838638.152] [node15 ON] TX >>> b'#1.16.15.LED=ON;\r\n'
+[838640.652] [node15 ON] RX <<< b'#1.16.15.LED=ON(TELNET);\r\n'
+
+[838640.952] Done.

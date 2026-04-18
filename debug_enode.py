@@ -120,23 +120,61 @@ async def main() -> None:
         print(f"  line {i:03d}: {line!r}")
 
     # ---------------------------------------------------------------
+    # Enable NOTIFY (same as the integration does on connect)
+    # ---------------------------------------------------------------
+    print(f"\n[{ts()}] === ENABLING NOTIFY ===")
+    for notify_cmd in [
+        b"#0.0.0.LED.NOTIFY=VALUE;\r\n",
+        b"#0.0.0.MOTOR.NOTIFY=ON;\r\n",
+    ]:
+        writer.write(notify_cmd)
+        await writer.drain()
+        print(f"[{ts()}] TX >>> {notify_cmd!r}")
+        resp = await raw_recv(reader, 1.5)
+        print(f"[{ts()}] NOTIFY RX: {resp!r}")
+        await asyncio.sleep(0.3)
+
+    # ---------------------------------------------------------------
     # Send test LED commands and capture responses
     # ---------------------------------------------------------------
     test_cmds = [
-        b"#2.1.1.LED=ON;\r\n",
-        b"#2.1.1.LED.VALUE=120;\r\n",
-        b"#2.1.1.LED=OFF;\r\n",
-        b"#2.1.0.LED=ON;\r\n",
-        b"#2.1.0.LED=OFF;\r\n",
+        # ON/OFF
+        ("ILC-DALI ON",        b"#1.16.0.LED=ON;\r\n"),
+        ("ILC-DALI OFF",       b"#1.16.0.LED=OFF;\r\n"),
+        # Brightness
+        ("VALUE=120",          b"#1.16.0.LED.VALUE=120;\r\n"),
+        ("VALUE=?",            b"#1.16.0.LED.VALUE=?;\r\n"),
+        # CCT candidates
+        ("SUN=120",            b"#1.16.0.LED.SUN=120;\r\n"),
+        ("SUN=?",              b"#1.16.0.LED.SUN=?;\r\n"),
+        ("CCT=3000",           b"#1.16.0.LED.CCT=3000;\r\n"),
+        ("CCT=?",              b"#1.16.0.LED.CCT=?;\r\n"),
+        ("SET=120,60",         b"#1.16.0.LED.SET=120,60;\r\n"),
+        ("SET=120,60 ?",       b"#1.16.0.LED.SET=?;\r\n"),
+        # STATUS
+        ("STATUS=?",           b"#1.16.0.LED.STATUS=?;\r\n"),
+        # Individual DALI node 1 — same tests
+        ("node1 ON",           b"#1.16.1.LED=ON;\r\n"),
+        ("node1 VALUE=120",    b"#1.16.1.LED.VALUE=120;\r\n"),
+        ("node1 VALUE=?",      b"#1.16.1.LED.VALUE=?;\r\n"),
+        ("node1 SUN=120",      b"#1.16.1.LED.SUN=120;\r\n"),
+        ("node1 OFF",          b"#1.16.1.LED=OFF;\r\n"),
+        # Nodes 2-5 ON/OFF (check if multiple work)
+        ("node2 ON",           b"#1.16.2.LED=ON;\r\n"),
+        ("node2 OFF",          b"#1.16.2.LED=OFF;\r\n"),
+        ("node14 ON",          b"#1.16.14.LED=ON;\r\n"),
+        ("node14 OFF",         b"#1.16.14.LED=OFF;\r\n"),
+        # Node 15+ — should not exist
+        ("node15 ON",          b"#1.16.15.LED=ON;\r\n"),
     ]
 
     print(f"\n[{ts()}] === MANUAL COMMAND TESTS ===")
-    for cmd in test_cmds:
+    for label, cmd in test_cmds:
         writer.write(cmd)
         await writer.drain()
-        print(f"[{ts()}] TX >>> {cmd!r}")
-        resp = await raw_recv(reader, 1.5)
-        print(f"[{ts()}] RX <<< {resp!r}")
+        print(f"[{ts()}] [{label}] TX >>> {cmd!r}")
+        resp = await raw_recv(reader, 2.5)
+        print(f"[{ts()}] [{label}] RX <<< {resp!r}")
         await asyncio.sleep(0.3)
 
     writer.close()

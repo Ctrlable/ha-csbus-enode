@@ -227,6 +227,19 @@ class TestHandleNotify:
         assert coord.get_state("2.1.1")["brightness_raw"] == 200
         assert coord.get_state("2.1.2")["brightness_raw"] == 100
 
+    def test_led_value_biwhite_cct(self) -> None:
+        coord = _make_coordinator()
+        coord.handle_notify("!1.16.0.LED.VALUE=60.120")
+        state = coord.get_state("1.16.0")
+        assert state["warm"] == 60
+        assert state["cool"] == 120
+        assert state["is_on"] is True
+
+    def test_led_value_biwhite_off(self) -> None:
+        coord = _make_coordinator()
+        coord.handle_notify("!1.16.0.LED.VALUE=0.0")
+        assert coord.get_state("1.16.0")["is_on"] is False
+
     def test_async_set_updated_data_called(self) -> None:
         coord = _make_coordinator()
         updates: list[Any] = []

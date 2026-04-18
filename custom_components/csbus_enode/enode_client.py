@@ -334,17 +334,37 @@ class ENodeClient:
                 done_event.set()
                 return
 
+        # Legacy e-Nodes (E-NODE/ADMIN firmware) may be mid-poll-cycle when
+        # DISCOVER is sent, causing an immediate !DONE,0 with no device data.
+        # A short settling delay and one retry recovers from this race.
+        _MAX_ATTEMPTS = 3
+        _RETRY_DELAY  = 8.0
+
         remove = self.add_listener(_on_msg)
         try:
-            # CRITICAL: the correct command is '>DISCOVER' not just 'DISCOVER'
-            await self._send_raw(">DISCOVER\r\n")
-            try:
-                await asyncio.wait_for(done_event.wait(), timeout=DISCOVER_TIMEOUT)
-            except asyncio.TimeoutError:
-                _LOGGER.debug(
-                    "DISCOVER: no !DONE after %ss — using %d device(s) collected so far",
-                    DISCOVER_TIMEOUT, len(devices_raw),
-                )
+            for attempt in range(_MAX_ATTEMPTS):
+                if attempt > 0:
+                    _LOGGER.info(
+                        "DISCOVER attempt %d/%d — retrying in %.0fs",
+                        attempt + 1, _MAX_ATTEMPTS, _RETRY_DELAY,
+                    )
+                    await asyncio.sleep(_RETRY_DELAY)
+                    devices_raw.clear()
+                    done_event.clear()
+
+                # CRITICAL: the correct command is '>DISCOVER' not just 'DISCOVER'
+                await self._send_raw(">DISCOVER\r\n")
+                try:
+                    await asyncio.wait_for(done_event.wait(), timeout=DISCOVER_TIMEOUT)
+                except asyncio.TimeoutError:
+                    _LOGGER.debug(
+                        "DISCOVER: no !DONE after %ss — using %d device(s) collected so far",
+                        DISCOVER_TIMEOUT, len(devices_raw),
+                    )
+
+                if devices_raw:
+                    break  # found at least one device, no need to retry
+                _LOGGER.debug("DISCOVER attempt %d returned 0 devices", attempt + 1)
         finally:
             remove()
 
