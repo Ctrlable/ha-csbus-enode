@@ -31,19 +31,20 @@ from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
-from . import ENodeCoordinator
 from .const import (
     CS_DEVICE_MOTOR,
     DATA_CLIENT,
     DATA_COORDINATOR,
-    DATA_COVER_ENTITIES,
     DATA_DEVICES,
     DOMAIN,
     MOTOR_STATUS_EXTENDING,
+    MOTOR_STATUS_HOME,
     MOTOR_STATUS_RETRACTING,
+    MOTOR_STATUS_STOP,
     PLATFORM_COVER,
 )
 from .enode_client import ENodeClient
+from . import ENodeCoordinator
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -66,7 +67,7 @@ async def async_setup_entry(
     data = hass.data[DOMAIN][entry.entry_id]
     coordinator: ENodeCoordinator = data[DATA_COORDINATOR]
     client: ENodeClient = data[DATA_CLIENT]
-    devices: list[dict[str, Any]] = data[DATA_DEVICES]
+    devices: list[dict] = data[DATA_DEVICES]
 
     covers = [
         CSBusCover(coordinator, client, dev)
@@ -74,10 +75,9 @@ async def async_setup_entry(
         if dev["platform"] == PLATFORM_COVER
     ]
     async_add_entities(covers)
-    hass.data[DOMAIN][entry.entry_id][DATA_COVER_ENTITIES] = covers
 
 
-class CSBusCover(CoordinatorEntity, CoverEntity):  # type: ignore[misc]
+class CSBusCover(CoordinatorEntity, CoverEntity):
     """Represents a CS-Bus IMC motor controller channel."""
 
     _attr_device_class = CoverDeviceClass.SHADE
@@ -110,7 +110,6 @@ class CSBusCover(CoordinatorEntity, CoverEntity):  # type: ignore[misc]
             name=self._device["alias"].rsplit(" Ch ", 1)[0] if " Ch " in self._device["alias"] else self._device["alias"],
             manufacturer="Converging Systems",
             model=self._device.get("type_name", "IMC"),
-            configuration_url=f"http://{self.coordinator.client.host}",
         )
 
     # ------------------------------------------------------------------
@@ -135,12 +134,12 @@ class CSBusCover(CoordinatorEntity, CoverEntity):  # type: ignore[misc]
     @property
     def is_opening(self) -> bool:
         state = self.coordinator.get_state(self._address)
-        return bool(state.get("motor_status") == MOTOR_STATUS_RETRACTING)
+        return state.get("motor_status") == MOTOR_STATUS_RETRACTING
 
     @property
     def is_closing(self) -> bool:
         state = self.coordinator.get_state(self._address)
-        return bool(state.get("motor_status") == MOTOR_STATUS_EXTENDING)
+        return state.get("motor_status") == MOTOR_STATUS_EXTENDING
 
     # ------------------------------------------------------------------
     # Commands

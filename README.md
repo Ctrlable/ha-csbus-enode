@@ -243,14 +243,6 @@ Use `0` as a wildcard: `2.1.0` targets all nodes in zone 2, group 1.
 - Legacy e-Node: `E-NODE` / `ADMIN`
 - e-Node MKIII+: `Telnet 1` / `Password 1` (or your customized credentials)
 
-**Device Count shows 0 after connecting:**
-This was a known bug in v1.0.0 fixed in v1.1.0. Three issues caused it:
-- The DISCOVER command was missing its required `>` prefix — the e-Node Telnet shell requires `>DISCOVER` to distinguish shell commands from CS-Bus traffic
-- The message parser only split on `;` breaking DISCOVER line-terminated responses (`+UID101\r\n`)
-- The 15-second timeout was too short for DALI buses that enumerate fixtures sequentially
-
-Update to v1.1.0 to resolve all three issues.
-
 ---
 
 ## Contributing

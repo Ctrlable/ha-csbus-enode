@@ -11,46 +11,21 @@ Device model
 DISCOVER returns one entry per CONTROLLABLE ADDRESS on the bus:
   - CS-Bus:  one UID per ILC/IMC controller
   - DMX:     one UID per DMX fixture (up to 32 per e-Node/dmx)
-  - DALI:    one ILC-DALI controller UID whose ZGN address covers all
-             individual DALI nodes (e.g. 1.16.0 = broadcast, 1.16.1-64
-             = individual fixtures)
+  - DALI:    one ILC-DALI controller UID; each DALI fixture has its
+             own ZGN address (zone.group.DALI_address, e.g. 2.1.1..2.1.64)
 
-DISCOVER failure — DALI bus crash
-----------------------------------
-When the DALI bus crashes the e-Node gateway stays online (its network
-stack is independent of the DALI bus layer) but immediately returns
-!DONE,0 with no device data.  This is the primary cause of DISCOVER
-returning 0 devices on this installation — not a commissioning gap or
-a polling race.
+State updates
+-------------
+The integration uses NOTIFY push (listen mode) as primary — the e-Node
+broadcasts state changes on the bus automatically after any command.
+Polling is used only as a fallback and is deliberately rate-limited to
+avoid flooding the gateway (especially critical for DMX/DALI).
 
-When manual_nodes is configured, device entities are created from the
-known ZGN address range regardless of DISCOVER outcome.  Commands are
-queued through the persistent Telnet session and take effect as soon as
-the DALI bus recovers, with no HA restart required.
-
-State updates — per bus type
------------------------------
-CS-Bus:
-  NOTIFY push is available — the e-Node broadcasts !Z.G.N.LED.VALUE /
-  !Z.G.N.LED.COLOR messages after every command.  Staggered polling is
-  the fallback.  NOTIFY is NOT enabled by this component (enode_client
-  never sends the wildcard NOTIFY enable) to keep the code safe across
-  all gateway types.
-
-DMX:
-  NOTIFY is never enabled — it would flood the gateway at 44 Hz per
-  fixture and crash the firmware.  Staggered polling is the only
-  mechanism, clamped to MIN_SCAN_INTERVAL_DMX.
-
-DALI (this installation):
-  The e-Node firmware does NOT send NOTIFY push for DALI buses.  DALI
-  query responses echo back as '#' messages (not '!' push), so
-  async_query always times out.  State is maintained exclusively through:
-    1. Optimistic updates written immediately after each command.
-    2. Command echoes: #Z.G.N.LED=ON(TELNET) / OFF(TELNET) parsed by
-       handle_notify to confirm ON/OFF transitions.
-  Polling is intentionally skipped for DALI — it would only produce
-  COMMAND_TIMEOUT noise on every coordinator cycle.
+Poll strategy:
+  - Polling is DISABLED by default (NOTIFY handles everything).
+  - When polling is enabled (configurable), we query ONE device every
+    POLL_STAGGER_DELAY seconds rather than all at once.
+  - DALI buses are never polled individually — they report via NOTIFY only.
 """
 
 from __future__ import annotations
@@ -68,7 +43,6 @@ from homeassistant.helpers.event import async_track_time_interval
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
 from .const import (
-    CONF_MANUAL_NODES,
     CONF_PASSWORD,
     CONF_PORT,
     CONF_SCAN_INTERVAL,
@@ -76,7 +50,6 @@ from .const import (
     DATA_CLIENT,
     DATA_COORDINATOR,
     DATA_DEVICES,
-    DEFAULT_MANUAL_NODES,
     DEFAULT_PASSWORD,
     DEFAULT_PORT,
     DEFAULT_SCAN_INTERVAL,
@@ -120,25 +93,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     discovered = await client.async_discover()
     _LOGGER.debug("e-Node raw discovery: %d device(s)", len(discovered))
 
-    # If DISCOVER found nothing, fall back to manually configured nodes.
-    #
-    # Primary cause on this installation: the DALI bus crashes at startup
-    # while the e-Node gateway stays online, causing !DONE,0 with no device
-    # data.  Manual nodes bypass DISCOVER entirely so entities always exist
-    # regardless of bus state.  A secondary cause is devices not yet
-    # commissioned with UIDs in e-Node Pilot.
-    if not discovered:
-        manual_spec = entry.options.get(
-            CONF_MANUAL_NODES,
-            entry.data.get(CONF_MANUAL_NODES, DEFAULT_MANUAL_NODES),
-        )
-        if manual_spec and manual_spec.strip():
-            discovered = _make_manual_devices(manual_spec)
-            _LOGGER.info(
-                "e-Node %s: DISCOVER returned 0 devices — using %d manual node(s) from config",
-                host, len(discovered),
-            )
-
     # _parse_devices maps the normalised dicts to HA platform descriptors
     devices = _parse_devices(discovered)
 
@@ -149,10 +103,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         host, len(devices), n_lights, n_covers,
     )
 
-    # Determine bus types present across all devices.
+    # Clamp scan_interval based on the bus types present
     bus_types = {d.get("bus_type", "I") for d in devices}
-
-    # Clamp scan_interval based on bus types present.
     if BUS_DMX in bus_types:
         scan_interval = max(scan_interval, MIN_SCAN_INTERVAL_DMX)
     if BUS_DALI in bus_types:
@@ -278,113 +230,6 @@ def _parse_devices(raw: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return devices
 
 
-def _parse_manual_nodes(spec: str) -> list[dict[str, Any]]:
-    """
-    Parse a manual node spec string into a list of node descriptor dicts.
-
-    Token format (comma or space separated, mixable):
-      RANGE[:bus[:colorspace[:cct[:warm_k[:cool_k]]]]]
-
-    Address / range formats:
-      Z.G.N          single ZGN address
-      Z.G.start-end  inclusive address range
-
-    Capability fields (all optional, positional after the address):
-      bus        D = DALI (default), X = DMX, I = CS-Bus
-      colorspace MONO (default), HSV
-      cct        0 = no CCT (default), 1 = tunable-white / CCT
-      warm_k     warm end in Kelvin (default 2700; ignored when cct=0)
-      cool_k     cool end in Kelvin (default 6500; ignored when cct=0)
-
-    Examples:
-      "1.16.1-14"                 DALI mono dimmers
-      "2.1.1-8:X:HSV"             DMX full-colour RGB fixtures
-      "2.1.9-12:X:MONO:1"         DMX tunable-white (CCT)
-      "2.1.9-12:X:MONO:1:3000:6500"  DMX CCT with custom Kelvin range
-      "3.1.1:I:HSV:1"             CS-Bus full-colour + CCT
-    """
-    _BUS_NAMES = {"D": BUS_DALI, "X": BUS_DMX, "I": "I"}
-    nodes: list[dict[str, Any]] = []
-
-    for token in re.split(r"[,\s]+", spec.strip()):
-        token = token.strip()
-        if not token:
-            continue
-
-        parts = token.split(":")
-        addr_part = parts[0]
-
-        bus_raw = parts[1].upper() if len(parts) > 1 and parts[1] else "D"
-        bus = _BUS_NAMES.get(bus_raw, BUS_DALI)
-
-        colorspace = parts[2].upper() if len(parts) > 2 and parts[2] else "MONO"
-        cct_support = len(parts) > 3 and parts[3] == "1"
-
-        try:
-            cct_warm = int(parts[4]) if len(parts) > 4 and parts[4] else 2700
-        except ValueError:
-            cct_warm = 2700
-        try:
-            cct_cool = int(parts[5]) if len(parts) > 5 and parts[5] else 6500
-        except ValueError:
-            cct_cool = 6500
-
-        # Expand range or accept a single address
-        m = re.match(r"^(\d+)\.(\d+)\.(\d+)-(\d+)$", addr_part)
-        if m:
-            z, g, s, e = int(m.group(1)), int(m.group(2)), int(m.group(3)), int(m.group(4))
-            addresses = [f"{z}.{g}.{n}" for n in range(s, e + 1)]
-        elif re.match(r"^\d+\.\d+\.\d+$", addr_part):
-            addresses = [addr_part]
-        else:
-            _LOGGER.warning("Ignoring unrecognised manual node token: %r", token)
-            continue
-
-        for addr in addresses:
-            nodes.append({
-                "addr":        addr,
-                "bus":         bus,
-                "colorspace":  colorspace,
-                "cct_support": cct_support,
-                "cct_warm":    cct_warm,
-                "cct_cool":    cct_cool,
-            })
-
-    return nodes
-
-
-def _make_manual_devices(spec: str) -> list[dict[str, Any]]:
-    """
-    Build synthetic normalised device descriptors from a manual node spec.
-
-    Used as a fallback when DISCOVER returns 0 devices.  Supports DALI, DMX,
-    and CS-Bus fixtures with any combination of color space and CCT capability.
-    """
-    _BUS_TYPE_NAMES = {BUS_DALI: "ILC-DALI", BUS_DMX: "e-Node/DMX", "I": "ILC"}
-    devices: list[dict[str, Any]] = []
-
-    for node in _parse_manual_nodes(spec):
-        addr = node["addr"]
-        bus  = node["bus"]
-        safe = addr.replace(".", "_")
-        devices.append({
-            "uid":          f"manual_{safe}",
-            "alias":        f"Light {addr}",
-            "address":      addr,
-            "platform":     PLATFORM_LIGHT,
-            "device_class": "LIGHT",
-            "color_space":  node["colorspace"],
-            "cct_support":  node["cct_support"],
-            "cct_warm":     node["cct_warm"],
-            "cct_cool":     node["cct_cool"],
-            "channels":     0 if node["colorspace"] == "HSV" else 1,
-            "bus_type":     bus,
-            "type_name":    _BUS_TYPE_NAMES.get(bus, bus),
-        })
-
-    return devices
-
-
 # ---------------------------------------------------------------------------
 # Coordinator
 # ---------------------------------------------------------------------------
@@ -393,17 +238,14 @@ class ENodeCoordinator(DataUpdateCoordinator):
     """
     State coordinator for all CS-Bus/DMX/DALI devices on one e-Node.
 
-    CS-Bus / DMX — NOTIFY push (primary):
-      The e-Node sends unsolicited !Z.G.N.LED.VALUE / COLOR messages after
-      any command.  Staggered polling (one device per cycle) is the fallback.
+    Primary method: NOTIFY push (listen mode).
+      The e-Node sends unsolicited state updates after any command.
+      No polling needed for devices with NOTIFY enabled.
 
-    DALI — optimistic + echo-based (only mechanism available):
-      This firmware does not send NOTIFY push for DALI buses, and query
-      responses echo back as '#' messages rather than '!' push, so neither
-      NOTIFY nor polling returns actual device state.  State is maintained
-      via optimistic writes in light.py and #Z.G.N.LED=ON/OFF(TELNET) echoes
-      parsed in handle_notify.  DALI is excluded from the polling loop to
-      avoid COMMAND_TIMEOUT noise on every update cycle.
+    Fallback: Staggered polling.
+      Queries devices one at a time with a delay between each to avoid
+      flooding the gateway — critical for DMX (max 32 fixtures) and
+      DALI (max 64 fixtures) which have limited command bandwidth.
     """
 
     def __init__(
@@ -437,26 +279,10 @@ class ENodeCoordinator(DataUpdateCoordinator):
         """
         Parse an inbound e-Node message and update state cache.
 
-        '!' messages carry authoritative state (CS-Bus NOTIFY push).
-        '#Z.G.N.LED=ON(TELNET)' echoes are produced by DALI firmware when a
-        command is executed on a specific node — parse these for ON/OFF state.
-        All other '#' echoes and '*' acknowledgements are ignored.
+        Only '!' (positive/unsolicited) messages carry state.
+        '#' echoes and '*' errors are ignored.
         """
         line = line.strip().rstrip(";")
-
-        # DALI firmware echoes: #Z.G.N.LED=ON(TELNET) / #Z.G.N.LED=OFF(TELNET)
-        m = re.match(r"^#(.+?)\.LED=ON\(TELNET\)$", line, re.IGNORECASE)
-        if m:
-            self._state.setdefault(m.group(1), {})["is_on"] = True
-            self.async_set_updated_data(dict(self._state))
-            return
-
-        m = re.match(r"^#(.+?)\.LED=OFF\(TELNET\)$", line, re.IGNORECASE)
-        if m:
-            self._state.setdefault(m.group(1), {})["is_on"] = False
-            self.async_set_updated_data(dict(self._state))
-            return
-
         if not line.startswith("!"):
             return
 
@@ -474,9 +300,6 @@ class ENodeCoordinator(DataUpdateCoordinator):
                                  b=int(parts[2]), w=int(parts[3]))
                 elif len(parts) == 3:
                     state.update(r=int(parts[0]), g=int(parts[1]), b=int(parts[2]))
-                elif len(parts) == 2:
-                    # Bi-white (CCT) device: VALUE=warm_channel.cool_channel
-                    state.update(warm=int(parts[0]), cool=int(parts[1]))
                 elif len(parts) == 1:
                     state["brightness_raw"] = int(parts[0])
                 state["is_on"] = any(int(p) > 0 for p in parts)
@@ -541,14 +364,12 @@ class ENodeCoordinator(DataUpdateCoordinator):
         Poll ONE device per coordinator update cycle (staggered polling).
 
         This prevents the gateway from being overwhelmed.
-        DALI devices are excluded: their query responses echo back as '#'
-        commands rather than '!' push messages, so async_query always times
-        out — polling them would only generate COMMAND_TIMEOUT noise.
+        DALI devices are skipped — they only support NOTIFY push.
         """
         if not self.client.is_connected:
             raise UpdateFailed("e-Node not connected")
 
-        # Skip DALI — queries echo as '#' not '!', so async_query always times out
+        # Filter to pollable devices (skip DALI — it only supports NOTIFY)
         pollable = [
             d for d in self.devices
             if d.get("bus_type", "I") != BUS_DALI

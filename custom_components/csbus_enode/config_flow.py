@@ -7,19 +7,18 @@ import logging
 from typing import Any
 
 import voluptuous as vol
+
 from homeassistant import config_entries
 from homeassistant.const import CONF_HOST, CONF_NAME
 from homeassistant.core import callback
 from homeassistant.data_entry_flow import FlowResult
 
 from .const import (
-    CONF_DEFAULT_TRANSITION,
-    CONF_MANUAL_NODES,
     CONF_PASSWORD,
     CONF_PORT,
-    CONF_SCAN_INTERVAL,
     CONF_USERNAME,
-    DEFAULT_MANUAL_NODES,
+    CONF_SCAN_INTERVAL,
+    CONF_DEFAULT_TRANSITION,
     DEFAULT_PASSWORD,
     DEFAULT_PORT,
     DEFAULT_SCAN_INTERVAL,
@@ -32,7 +31,7 @@ from .enode_client import ENodeClient
 _LOGGER = logging.getLogger(__name__)
 
 
-class CSBusENodeConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):  # type: ignore[misc, call-arg]
+class CSBusENodeConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     """Handle the setup wizard for the e-Node integration."""
 
     VERSION = 1
@@ -67,10 +66,9 @@ class CSBusENodeConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):  # type: i
                             CONF_PORT: port,
                             CONF_USERNAME: username,
                             CONF_PASSWORD: password,
-                            CONF_MANUAL_NODES: user_input.get(CONF_MANUAL_NODES, DEFAULT_MANUAL_NODES),
                         },
                     )
-            except TimeoutError:
+            except asyncio.TimeoutError:
                 errors["base"] = "cannot_connect"
             except Exception:
                 _LOGGER.exception("Unexpected error during e-Node connection test")
@@ -85,7 +83,6 @@ class CSBusENodeConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):  # type: i
                 ),
                 vol.Optional(CONF_USERNAME, default=DEFAULT_USERNAME): str,
                 vol.Optional(CONF_PASSWORD, default=DEFAULT_PASSWORD): str,
-                vol.Optional(CONF_MANUAL_NODES, default=DEFAULT_MANUAL_NODES): str,
             }
         )
 
@@ -100,14 +97,14 @@ class CSBusENodeConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):  # type: i
         )
 
     @staticmethod
-    @callback  # type: ignore[untyped-decorator]
+    @callback
     def async_get_options_flow(
         config_entry: config_entries.ConfigEntry,
     ) -> CSBusENodeOptionsFlow:
         return CSBusENodeOptionsFlow(config_entry)
 
 
-class CSBusENodeOptionsFlow(config_entries.OptionsFlow):  # type: ignore[misc]
+class CSBusENodeOptionsFlow(config_entries.OptionsFlow):
     """Allow the user to tweak scan interval and default transition."""
 
     def __init__(self, config_entry: config_entries.ConfigEntry) -> None:
@@ -133,13 +130,6 @@ class CSBusENodeOptionsFlow(config_entries.OptionsFlow):  # type: ignore[misc]
                         CONF_DEFAULT_TRANSITION, DEFAULT_TRANSITION
                     ),
                 ): vol.All(int, vol.Range(min=0, max=60)),
-                vol.Optional(
-                    CONF_MANUAL_NODES,
-                    default=self.config_entry.options.get(
-                        CONF_MANUAL_NODES,
-                        self.config_entry.data.get(CONF_MANUAL_NODES, DEFAULT_MANUAL_NODES),
-                    ),
-                ): str,
             }
         )
 

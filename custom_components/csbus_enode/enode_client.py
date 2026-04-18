@@ -6,71 +6,38 @@ Supports ALL three bus types via the unified Telnet DISCOVER command:
   - DMX     (any DMX512 fixture via e-Node/dmx)            bus type = X
   - DALI    (DALI-TW, DALI-C etc via ILC-DALI controller) bus type = D
 
-DISCOVERY — how it actually works
-----------------------------------
-The correct Telnet shell command is:   >DISCOVER\r\n   (note the leading '>')
-The e-Node replies with a burst of lines like:
+CRASH PREVENTION
+-----------------
+The e-Node/dmx has very limited command bandwidth (~32 DMX fixtures max).
+Rules this client MUST follow to avoid crashing the gateway:
 
-  +UID101;\r\n                              <- new device announced
-  #UID101.TYPE=?;\r\n                       <- e-Node querying its own bus
-  !UID101.TYPE=ILC-DALI;\r\n               <- device type
-  !UID101.FORM=0,D,LIGHT,MONO,TRUE;\r\n    <- capabilities
-  #UID101.ALIAS=?;\r\n
-  !UID101.ALIAS=Main Cove RGBV;\r\n
-  #UID101.BUS.ADDRESS=?;\r\n
-  !UID101.BUS.ADDRESS=2.1.1;\r\n
-  !DONE,5;\r\n                              <- all done
+1. NEVER send broadcast queries like #0.0.0.LED.VALUE=?
+   A broadcast query forces the e-Node to collect responses from ALL
+   connected devices simultaneously — this overwhelms the internal bus
+   and crashes DMX/DALI gateways.
 
-FORM field positions:
-  [0] channel count  (0=full-color, 1=mono, 2=bi-white, 3=RGB, 4=RGBW)
-  [1] bus type       (I=CS-Bus, X=DMX, D=DALI)
-  [2] device class   (LIGHT, MOTOR, KEYPAD)
-  [3] color space    (HSV, MONO)
-  [4] CCT support    (TRUE / FALSE)
+2. Keepalive must be a NULL/no-op — not a query.
+   The e-Node Telnet shell accepts a bare carriage return to keep a
+   session alive without triggering any bus traffic.
 
-DISCOVER returning !DONE,0
----------------------------
-There are two causes of !DONE,0:
-  1. Timing race — the e-Node is mid-poll-cycle when DISCOVER arrives and
-     immediately closes the enumeration.  One retry after a short delay
-     usually recovers from this.
-  2. DALI bus crash — the ILC-DALI controller is unresponsive so the
-     e-Node has no devices to enumerate.  !DONE,0 arrives within ~1 s.
-     Retries will not help; configure manual_nodes as the fallback.
+3. DISCOVER must only be run ONCE at startup — not repeatedly.
+   The DISCOVER command walks the entire bus sequentially — running it
+   while the system is active would interfere with normal operation.
 
-async_discover detects a quick !DONE,0 (< DISCOVER_QUICK_DONE_THRESHOLD)
-and skips further retries when the bus fault pattern is recognised, rather
-than waiting through the full retry cycle.
+4. Reconnect must not spawn duplicate tasks.
+   Track a _reconnecting flag to prevent concurrent reconnect attempts.
 
-DMX — NOTIFY and wildcard queries are FATAL
---------------------------------------------
-DMX buses refresh at up to 44 Hz.  The wildcard NOTIFY enable
-  #0.0.0.LED.NOTIFY=VALUE;\r\n
-causes the e-Node to push a VALUE message for every channel change on every
-fixture — potentially hundreds per second — overflowing its TCP output buffer
-and crashing the firmware (gateway goes completely offline).
+COMMAND PROTOCOL
+-----------------
+  Send:   #Z.G.N.DEVICE=COMMAND;\r\n
+  Query:  #Z.G.N.DEVICE.ITEM=?;\r\n  (specific address only, never 0.0.0)
+  Positive response: !Z.G.N.DEVICE.ITEM=value
+  Negative response: *... (partial echo — command rejected)
 
-Wildcard queries (0.0.0 ZGN) are equally dangerous: they cause all DMX
-fixtures to respond simultaneously.
-
-NOTIFY is therefore NEVER enabled by this client.  Wildcard commands and
-queries (ZGN containing "0.0.0") are blocked in async_send_command,
-async_send_item_command, and async_query.
-
-DALI state feedback
---------------------
-This firmware does NOT send NOTIFY push for DALI buses.  The only real-time
-feedback available is the command echo:
-  #Z.G.N.LED=ON(TELNET)  /  #Z.G.N.LED=OFF(TELNET)
-produced when a specific node (non-wildcard) executes the command.
-ENodeCoordinator.handle_notify parses these for ON/OFF state.
-
-IMPORTANT parser notes
------------------------
-The receive loop splits on \\r\\n (line-based) — NOT only on semicolons.
-DISCOVER responses are newline-terminated.
-CS-Bus NOTIFY/query responses end with semicolon then newline.
-We handle both cleanly in _split_messages().
+DISCOVER PROTOCOL
+------------------
+  Send:   >DISCOVER\r\n
+  Recv:   +UID101\r\n, !UID101.TYPE=..., !UID101.FORM=..., !DONE,N
 """
 
 from __future__ import annotations
@@ -82,13 +49,14 @@ from typing import Any, Callable
 
 _LOGGER = logging.getLogger(__name__)
 
-TELNET_PORT = 23
-CONNECT_TIMEOUT = 10.0
-COMMAND_TIMEOUT = 5.0
+TELNET_PORT      = 23
+CONNECT_TIMEOUT  = 10.0
+COMMAND_TIMEOUT  = 5.0
+# Keepalive: send a bare \r\n — keeps TCP session alive, zero bus traffic
 KEEPALIVE_INTERVAL = 30.0
-RECONNECT_DELAY = 10.0
-DISCOVER_TIMEOUT = 25.0        # DALI buses can be slow — live test showed 16 s response time
-DISCOVER_QUICK_DONE_THRESHOLD = 2.0  # !DONE,0 within this many seconds → likely bus fault, not race
+# DALI buses are slow to enumerate — give plenty of time
+DISCOVER_TIMEOUT = 25.0
+RECONNECT_DELAY  = 10.0
 
 # Bus type constants (FORM field position 1)
 BUS_CSBUS = "I"
@@ -109,7 +77,7 @@ def _strip_telnet_negotiation(data: bytes) -> bytes:
         if b == _IAC and i + 1 < len(data):
             nb = data[i + 1]
             if nb in _TELNET_CMDS and i + 2 < len(data):
-                i += 3          # skip IAC CMD OPTION
+                i += 3
                 continue
             elif nb == _IAC:
                 out.append(_IAC)
@@ -122,44 +90,32 @@ def _strip_telnet_negotiation(data: bytes) -> bytes:
 
 def _split_messages(buf: bytes) -> tuple[list[str], bytes]:
     """
-    Split the receive buffer into complete messages and a leftover fragment.
+    Split receive buffer into complete messages and a leftover fragment.
 
-    Messages may end with:
-      \\r\\n          — DISCOVER shell responses
-      ;\\r\\n         — CS-Bus NOTIFY/query responses (most common)
-      ;\\r  or  ;\\n  — older firmware variants
-
-    Returns (list_of_clean_strings, remaining_bytes).
-    Each string has surrounding whitespace and trailing semicolons stripped.
+    Handles all e-Node line terminator variants:
+      \\r\\n        — DISCOVER shell output
+      ;\\r\\n       — CS-Bus NOTIFY/query responses
+      ;\\r or ;\\n  — older firmware
     """
     messages: list[str] = []
-    # Decode to string for easier splitting
     text = buf.decode("ascii", errors="ignore")
-
-    # Split on any recognised line terminator (semicolon optional before newline)
     parts = re.split(r";?\r\n|;\r(?!\n)|;\n", text)
-
-    # The last element has no terminator yet — it's our leftover fragment
-    complete = parts[:-1]
-    leftover = parts[-1]
-
-    for part in complete:
+    for part in parts[:-1]:
         cleaned = part.strip().rstrip(";").strip()
         if cleaned:
             messages.append(cleaned)
-
-    return messages, leftover.encode("ascii", errors="ignore")
+    return messages, parts[-1].encode("ascii", errors="ignore")
 
 
 class ENodeClient:
     """
     Async Telnet client for the Converging Systems e-Node gateway.
 
-    - Persistent TCP connection with automatic reconnect
-    - Plaintext Telnet authentication (optional on e-Node)
-    - DISCOVER command enumerates CS-Bus, DMX and DALI fixtures
-    - Dispatches NOTIFY push messages to registered listeners
-    - Sends CS-Bus ASCII commands (works transparently for all bus types)
+    Gateway-safe design:
+    - Keepalive sends bare \\r\\n — zero bus traffic
+    - Never broadcasts queries to 0.0.0 addresses
+    - Reconnect is guarded against concurrent attempts
+    - DISCOVER runs once at startup only
     """
 
     def __init__(
@@ -169,17 +125,17 @@ class ENodeClient:
         username: str = "Telnet 1",
         password: str = "Password 1",
     ) -> None:
-        self.host = host
-        self.port = port
+        self.host     = host
+        self.port     = port
         self.username = username
         self.password = password
 
         self._reader: asyncio.StreamReader | None = None
         self._writer: asyncio.StreamWriter | None = None
-        self._connected = False
-        self._reconnecting = False
+        self._connected    = False
+        self._reconnecting = False   # guard against concurrent reconnects
         self._listeners: list[Callable[[str], None]] = []
-        self._recv_task: asyncio.Task | None = None
+        self._recv_task:      asyncio.Task | None = None
         self._keepalive_task: asyncio.Task | None = None
         self._lock = asyncio.Lock()
         self._firmware_year: str = ""
@@ -200,6 +156,7 @@ class ENodeClient:
 
     async def async_connect(self) -> bool:
         """Open Telnet connection and authenticate. Returns True on success."""
+        # Prevent re-entrant connects
         if self._connected:
             return True
         try:
@@ -210,14 +167,17 @@ class ENodeClient:
             )
             await self._authenticate()
             self._connected = True
+            self._reconnecting = False
             self._recv_task = asyncio.create_task(
                 self._receive_loop(), name=f"enode_recv_{self.host}"
             )
             self._keepalive_task = asyncio.create_task(
                 self._keepalive_loop(), name=f"enode_keepalive_{self.host}"
             )
-            _LOGGER.info("e-Node connected at %s (firmware year: %s)",
-                         self.host, self._firmware_year or "unknown")
+            _LOGGER.info(
+                "e-Node connected at %s (firmware: %s)",
+                self.host, self._firmware_year or "unknown",
+            )
             return True
         except (OSError, asyncio.TimeoutError) as exc:
             _LOGGER.error("e-Node connection failed (%s): %s", self.host, exc)
@@ -227,6 +187,7 @@ class ENodeClient:
     async def async_disconnect(self) -> None:
         """Cleanly tear down the connection."""
         self._connected = False
+        self._reconnecting = False
         for task in (self._recv_task, self._keepalive_task):
             if task and not task.done():
                 task.cancel()
@@ -245,32 +206,31 @@ class ENodeClient:
 
     async def async_send_command(self, zgn: str, device: str, command: str) -> bool:
         """
-        Send a CS-Bus control command.
-        Format:  #Z.G.N.DEVICE=COMMAND;\\r\\n
-        The e-Node translates automatically for DMX and DALI fixtures.
+        Send a CS-Bus command to a SPECIFIC address (never wildcard 0.0.0).
+        Format: #Z.G.N.DEVICE=COMMAND;\\r\\n
         """
         if "0.0.0" in zgn:
-            _LOGGER.warning("Refusing broadcast command to %s — would flood DMX/DALI gateway", zgn)
+            _LOGGER.warning("Refusing broadcast command to %s — would flood gateway", zgn)
             return False
         return await self._send_raw(f"#{zgn}.{device}={command};\r\n")
 
     async def async_send_item_command(
         self, zgn: str, device: str, item: str, value: str
     ) -> bool:
-        """Send:  #Z.G.N.DEVICE.ITEM=VALUE;\\r\\n"""
+        """Send: #Z.G.N.DEVICE.ITEM=VALUE;\\r\\n"""
         if "0.0.0" in zgn:
-            _LOGGER.warning("Refusing broadcast item command to %s — would flood DMX/DALI gateway", zgn)
+            _LOGGER.warning("Refusing broadcast item command to %s", zgn)
             return False
         return await self._send_raw(f"#{zgn}.{device}.{item}={value};\r\n")
 
     async def async_query(self, zgn: str, device: str, item: str) -> str | None:
         """
-        Send a query and return the response value, or None on timeout.
-        Sends:     #Z.G.N.DEVICE.ITEM=?;\\r\\n
-        Receives:  !Z.G.N.DEVICE.ITEM=value;
+        Query a SPECIFIC device for a value. Never use wildcard addresses.
+        Sends:    #Z.G.N.DEVICE.ITEM=?;\\r\\n
+        Returns:  value string, or None on timeout.
         """
         if "0.0.0" in zgn:
-            _LOGGER.warning("Refusing broadcast query to %s — would flood DMX/DALI gateway", zgn)
+            _LOGGER.warning("Refusing broadcast query to %s — would flood gateway", zgn)
             return None
         msg = f"#{zgn}.{device}.{item}=?;\r\n"
         event = asyncio.Event()
@@ -300,28 +260,22 @@ class ENodeClient:
 
     async def async_discover(self) -> list[dict[str, Any]]:
         """
-        Run the Telnet DISCOVER command and enumerate all devices.
-
-        Sends:  >DISCOVER\\r\\n
-        Waits for !DONE or the DISCOVER_TIMEOUT, then returns every
-        device found as a normalised descriptor dict.
-
-        Works for CS-Bus, DMX and DALI — the FORM field identifies each.
+        Run >DISCOVER once to enumerate all CS-Bus / DMX / DALI devices.
+        Must only be called once at startup — not during normal operation.
         """
         if not self._connected:
-            _LOGGER.warning("DISCOVER called but e-Node not connected")
+            _LOGGER.warning("DISCOVER: not connected")
             return []
 
         devices_raw: dict[str, dict] = {}
         done_event = asyncio.Event()
 
         def _on_msg(line: str) -> None:
-            # Strip trailing semicolons left over from the splitter
             line = line.strip().rstrip(";").strip()
             if not line:
                 return
 
-            # +UID101  — new device announced
+            # +UID101
             m = re.match(r"^\+UID(\w+)$", line, re.IGNORECASE)
             if m:
                 uid = m.group(1)
@@ -341,12 +295,10 @@ class ENodeClient:
                 devices_raw.setdefault(m.group(1), {"uid": m.group(1)})["form"] = m.group(2).strip()
                 return
 
-            # !UID101.ALIAS=Main Cove RGBV  (value may be empty)
-            m = re.match(r"^!UID(\w+)\.ALIAS=(.*)$", line, re.IGNORECASE)
+            # !UID101.ALIAS=Main Cove RGBV
+            m = re.match(r"^!UID(\w+)\.ALIAS=(.+)$", line, re.IGNORECASE)
             if m:
-                val = m.group(2).strip()
-                if val:
-                    devices_raw.setdefault(m.group(1), {"uid": m.group(1)})["alias"] = val
+                devices_raw.setdefault(m.group(1), {"uid": m.group(1)})["alias"] = m.group(2).strip()
                 return
 
             # !UID101.BUS.ADDRESS=2.1.1
@@ -384,73 +336,25 @@ class ENodeClient:
             # !DONE,5
             m = re.match(r"^!DONE,(\d+)$", line, re.IGNORECASE)
             if m:
-                _LOGGER.debug("DISCOVER !DONE — %s device(s) enumerated", m.group(1))
+                _LOGGER.debug("DISCOVER !DONE — %s device(s)", m.group(1))
                 done_event.set()
                 return
 
-        # DISCOVER returning !DONE,0 has two causes:
-        #
-        #   Timing race: the e-Node is mid-poll-cycle and closes the
-        #   enumeration immediately.  !DONE,0 arrives after some latency
-        #   while the bus is queried (~1–8 s).  One retry after a short
-        #   settling delay usually recovers.
-        #
-        #   DALI bus crash: the ILC-DALI controller is unresponsive so
-        #   the e-Node has nothing to enumerate.  !DONE,0 arrives within
-        #   ~1 s (DISCOVER_QUICK_DONE_THRESHOLD).  Retrying is pointless;
-        #   the caller should use manual_nodes as the fallback instead.
-        #
-        # We distinguish the two by timing: a quick !DONE,0 skips further
-        # retries to avoid wasting startup time.
-        _MAX_ATTEMPTS = 3
-        _RETRY_DELAY  = 8.0
-
         remove = self.add_listener(_on_msg)
         try:
-            for attempt in range(_MAX_ATTEMPTS):
-                if attempt > 0:
-                    _LOGGER.info(
-                        "DISCOVER attempt %d/%d — retrying in %.0fs",
-                        attempt + 1, _MAX_ATTEMPTS, _RETRY_DELAY,
-                    )
-                    await asyncio.sleep(_RETRY_DELAY)
-                    devices_raw.clear()
-                    done_event.clear()
-
-                # CRITICAL: the correct command is '>DISCOVER' not just 'DISCOVER'
-                t0 = asyncio.get_event_loop().time()
-                await self._send_raw(">DISCOVER\r\n")
-                try:
-                    await asyncio.wait_for(done_event.wait(), timeout=DISCOVER_TIMEOUT)
-                except asyncio.TimeoutError:
-                    _LOGGER.debug(
-                        "DISCOVER: no !DONE after %ss — using %d device(s) collected so far",
-                        DISCOVER_TIMEOUT, len(devices_raw),
-                    )
-
-                if devices_raw:
-                    break  # found at least one device, no need to retry
-
-                elapsed = asyncio.get_event_loop().time() - t0
-                if elapsed < DISCOVER_QUICK_DONE_THRESHOLD:
-                    # !DONE,0 arrived almost instantly — DALI bus is likely crashed,
-                    # not a timing race.  Further retries won't help.
-                    _LOGGER.warning(
-                        "DISCOVER returned !DONE,0 in %.1fs — DALI bus may be crashed. "
-                        "Configure manual_nodes in integration options as fallback.",
-                        elapsed,
-                    )
-                    break
-
-                _LOGGER.debug("DISCOVER attempt %d returned 0 devices", attempt + 1)
+            await self._send_raw(">DISCOVER\r\n")
+            try:
+                await asyncio.wait_for(done_event.wait(), timeout=DISCOVER_TIMEOUT)
+            except asyncio.TimeoutError:
+                _LOGGER.debug(
+                    "DISCOVER: no !DONE after %ss — using %d device(s) so far",
+                    DISCOVER_TIMEOUT, len(devices_raw),
+                )
         finally:
             remove()
 
         result = [_normalise_device(d) for d in devices_raw.values() if d.get("uid")]
-        _LOGGER.info(
-            "e-Node DISCOVER complete: %d device(s) found at %s",
-            len(result), self.host,
-        )
+        _LOGGER.info("e-Node DISCOVER: %d device(s) at %s", len(result), self.host)
         return result
 
     @property
@@ -482,16 +386,7 @@ class ENodeClient:
                 return False
 
     async def _authenticate(self) -> None:
-        """
-        Handle Telnet login if the e-Node has authentication enabled.
-
-        Flow:
-          <- User:\r\n
-          -> Telnet 1\r\n
-          <- Password:\r\n
-          -> Password 1\r\n
-          <- Connected:\r\n
-        """
+        """Handle Telnet login prompt if auth is enabled on the e-Node."""
         assert self._reader and self._writer
         buf = b""
         deadline = asyncio.get_event_loop().time() + 6.0
@@ -523,13 +418,12 @@ class ENodeClient:
             except asyncio.TimeoutError:
                 pass
 
-        # Capture firmware year from banner if present (e.g. "e-Node MkIV … 2023")
         m = re.search(r'\b(20\d{2})\b', text_orig)
         if m:
             self._firmware_year = m.group(1)
 
     async def _receive_loop(self) -> None:
-        """Read from the socket, split into clean messages, dispatch to listeners."""
+        """Read from the socket, split into messages, dispatch to listeners."""
         assert self._reader
         buf = b""
 
@@ -545,7 +439,7 @@ class ENodeClient:
                     _LOGGER.debug("e-Node RX: %s", msg)
                     self._dispatch(msg)
             except asyncio.TimeoutError:
-                continue  # normal idle; keepalive handles session health
+                continue
             except (OSError, ConnectionResetError) as exc:
                 _LOGGER.warning("e-Node receive error: %s", exc)
                 break
@@ -558,32 +452,32 @@ class ENodeClient:
             try:
                 cb(line)
             except Exception:
-                _LOGGER.exception("Listener callback raised an exception")
+                _LOGGER.exception("Listener callback error")
 
     async def _keepalive_loop(self) -> None:
-        """Keep the Telnet session alive without issuing any bus queries.
+        """
+        Keep the Telnet session alive with a bare carriage return.
 
-        The previous implementation sent  #0.0.0.LED.VALUE=?;\r\n  which is a
-        wildcard query — fine for DALI (single echo response) but catastrophic
-        for DMX: it triggers all registered fixtures to respond simultaneously,
-        producing a burst of up to 32 messages every 45 s that can destabilise
-        the e-Node firmware.
-
-        TCP SO_KEEPALIVE (set in async_connect) handles dead-connection detection
-        at the OS level.  Here we just send a blank line so the Telnet server's
-        own idle timer never fires, without touching the bus at all.
+        CRITICAL: Do NOT send any CS-Bus queries here.
+        A wildcard query like #0.0.0.LED.VALUE=? forces the e-Node to
+        poll ALL connected devices simultaneously and will crash DMX/DALI
+        gateways. A bare \\r\\n is sufficient to keep the TCP session alive
+        and generates zero bus traffic.
         """
         while self._connected:
             await asyncio.sleep(KEEPALIVE_INTERVAL)
             if self._connected:
+                # Bare CR/LF — keeps TCP session alive, zero bus traffic
                 await self._send_raw("\r\n")
 
     async def _reconnect(self) -> None:
-        """Re-establish a dropped connection."""
+        """Re-establish a dropped connection. Guarded against concurrent calls."""
         if self._reconnecting:
             return
         self._reconnecting = True
         self._connected = False
+
+        # Cancel existing tasks cleanly
         for task in (self._recv_task, self._keepalive_task):
             if task and not task.done():
                 task.cancel()
@@ -591,14 +485,16 @@ class ENodeClient:
                     await task
                 except asyncio.CancelledError:
                     pass
+
         if self._writer:
             try:
                 self._writer.close()
             except Exception:
                 pass
-        self._writer = None
-        self._reader = None
-        _LOGGER.info("e-Node: reconnecting in %ss…", RECONNECT_DELAY)
+            self._writer = None
+            self._reader = None
+
+        _LOGGER.info("e-Node %s: reconnecting in %ss…", self.host, RECONNECT_DELAY)
         await asyncio.sleep(RECONNECT_DELAY)
         self._reconnecting = False
         await self.async_connect()
@@ -610,15 +506,14 @@ class ENodeClient:
 
 def _parse_form(form_str: str) -> dict[str, Any]:
     """
-    Parse the FORM capability string: "channels,bus,class,colorspace,cct"
+    Parse FORM capability string: "channels,bus,class,colorspace,cct"
 
-    Real-world examples from DDK Appendix 2:
+    Examples:
       "0,I,LIGHT,HSV,TRUE"   — ILC full-color CS-Bus with CCT
       "0,X,LIGHT,HSV,FALSE"  — DMX full-color fixture
-      "0,D,LIGHT,MONO,TRUE"  — DALI tunable-white (DALI-TW)
+      "0,D,LIGHT,MONO,TRUE"  — DALI tunable-white
       "1,I,MOTOR,0,0"        — IMC-100 single-channel motor
       "4,I,LIGHT,MONO,FALSE" — ILC-400m 4-channel monochrome
-      "2,I,LIGHT,MONO,TRUE"  — ILC-400BE bi-white
     """
     parts = [p.strip() for p in form_str.split(",")]
 
@@ -642,24 +537,22 @@ def _parse_form(form_str: str) -> dict[str, Any]:
 def _normalise_device(raw: dict[str, Any]) -> dict[str, Any]:
     """
     Convert a raw DISCOVER response dict into a standard HA device descriptor.
-    The same structure is consumed by __init__._parse_devices(), light.py and cover.py.
     """
-    uid      = str(raw.get("uid", ""))
-    alias    = str(raw.get("alias", f"Device {uid}")).strip()
-    address  = str(raw.get("address", "2.1.1")).strip().rstrip(".")
+    uid       = str(raw.get("uid", ""))
+    alias     = str(raw.get("alias", f"Device {uid}")).strip()
+    address   = str(raw.get("address", "2.1.1")).strip().rstrip(".")
     type_name = str(raw.get("type", "")).strip()
 
     form_str = raw.get("form", "")
     if form_str:
         form = _parse_form(form_str)
     else:
-        # No FORM — infer from type name
         is_motor = any(x in type_name.upper() for x in ("IMC", "MOTOR", "BRIC"))
         form = {
             "channels":     0,
             "bus_type":     BUS_CSBUS,
             "device_class": "MOTOR" if is_motor else "LIGHT",
-            "color_space":  "MONO" if is_motor else "HSV",
+            "color_space":  "MONO"  if is_motor else "HSV",
             "cct_support":  False,
         }
 
@@ -680,7 +573,6 @@ def _normalise_device(raw: dict[str, Any]) -> dict[str, Any]:
         "type_name":    type_name or f"e-Node/{form['bus_type']}",
     }
 
-    # Multi-channel motor (IMC-300 with A/B/C/D channels)
     if form["device_class"] == "MOTOR" and raw.get("channel_addresses"):
         desc["channel_addresses"] = raw["channel_addresses"]
         desc["channel_aliases"]   = raw.get("channel_aliases", {})

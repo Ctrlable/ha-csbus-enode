@@ -50,18 +50,3 @@ PLATFORM_COVER = "cover"
 DATA_CLIENT = "client"
 DATA_COORDINATOR = "coordinator"
 DATA_DEVICES = "devices"
-DATA_LIGHT_ENTITIES = "light_entities"
-DATA_COVER_ENTITIES = "cover_entities"
-
-# Manual node fallback (when DISCOVER returns 0 devices)
-# Format: "Z.G.start-end" ranges or comma/space-separated ZGN addresses
-# Example: "1.16.1-14" or "1.16.1,1.16.2,1.16.5"
-CONF_MANUAL_NODES = "manual_nodes"
-DEFAULT_MANUAL_NODES = ""
-
-# Service names
-SERVICE_RECALL_PRESET = "csbus_recall_preset"
-SERVICE_STORE_PRESET = "csbus_store_preset"
-SERVICE_SET_CIRCADIAN = "csbus_set_circadian"
-SERVICE_RESUME_CIRCADIAN = "csbus_resume_circadian"
-SERVICE_SET_DISSOLVE = "csbus_set_dissolve"
