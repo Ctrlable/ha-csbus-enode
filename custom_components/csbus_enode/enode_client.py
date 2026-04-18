@@ -50,7 +50,7 @@ CONNECT_TIMEOUT = 10.0
 COMMAND_TIMEOUT = 5.0
 KEEPALIVE_INTERVAL = 45.0
 RECONNECT_DELAY = 5.0
-DISCOVER_TIMEOUT = 20.0   # DALI buses can be slow — allow more time
+DISCOVER_TIMEOUT = 30.0   # DALI buses can be slow — live test showed 16 s response time
 
 # Bus type constants (FORM field position 1)
 BUS_CSBUS = "I"
@@ -287,10 +287,12 @@ class ENodeClient:
                 devices_raw.setdefault(m.group(1), {"uid": m.group(1)})["form"] = m.group(2).strip()
                 return
 
-            # !UID101.ALIAS=Main Cove RGBV
-            m = re.match(r"^!UID(\w+)\.ALIAS=(.+)$", line, re.IGNORECASE)
+            # !UID101.ALIAS=Main Cove RGBV  (value may be empty)
+            m = re.match(r"^!UID(\w+)\.ALIAS=(.*)$", line, re.IGNORECASE)
             if m:
-                devices_raw.setdefault(m.group(1), {"uid": m.group(1)})["alias"] = m.group(2).strip()
+                val = m.group(2).strip()
+                if val:
+                    devices_raw.setdefault(m.group(1), {"uid": m.group(1)})["alias"] = val
                 return
 
             # !UID101.BUS.ADDRESS=2.1.1

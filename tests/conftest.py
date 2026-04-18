@@ -174,6 +174,10 @@ def _install_ha_stubs() -> None:
         "homeassistant.core": core_mod,
         "homeassistant.config_entries": config_entries_mod,
         "homeassistant.helpers": _make_module("homeassistant.helpers"),
+        "homeassistant.helpers.event": _make_module(
+            "homeassistant.helpers.event",
+            async_track_time_interval=MagicMock(),
+        ),
         "homeassistant.helpers.update_coordinator": huc,
         "homeassistant.helpers.entity": entity_mod,
         "homeassistant.helpers.entity_platform": entity_platform_mod,

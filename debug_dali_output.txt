@@ -1,0 +1,41 @@
+[837627.739] Connecting to 172.16.1.19:23 …
+[837627.756] TCP connected
+
+[837631.756] === BANNER (5 bytes) ===
+b'User:'
+
+[837631.756] Auth prompt detected — sending username: 'E-NODE'
+[837631.775] AFTER_USER_RX: b'Password:'
+[837631.775] TX >>> 'ADMIN'
+[837634.775] AUTH RESPONSE: b'Connected:\n\x00#1.16.0.LED.COLOR=?;\r\n'
+
+[837634.775] TX >>> b'>DISCOVER\r\n'
+[837634.775] Capturing DISCOVER response for 25 s …
+[837650.986] CHUNK (105 bytes): b'!UID16.FORM=1,I,LIGHT,MONO,TRUE;\r\n!UID16.ALIAS=;\r\n!UID16.BUS.ADDRESS=1.16.0;\r\n!UID16.LED.CMS.WARM=1800;\r\n'
+[837650.995] CHUNK (36 bytes): b'!UID16.LED.CMS.COOL=4000;\r\n!DONE,0\r\n'
+
+[837659.776] === FULL DISCOVER BUFFER (141 bytes) ===
+b'!UID16.FORM=1,I,LIGHT,MONO,TRUE;\r\n!UID16.ALIAS=;\r\n!UID16.BUS.ADDRESS=1.16.0;\r\n!UID16.LED.CMS.WARM=1800;\r\n!UID16.LED.CMS.COOL=4000;\r\n!DONE,0\r\n'
+
+[837659.776] === DISCOVER LINE-BY-LINE ===
+  line 000: b'!UID16.FORM=1,I,LIGHT,MONO,TRUE;\r'
+  line 001: b'!UID16.ALIAS=;\r'
+  line 002: b'!UID16.BUS.ADDRESS=1.16.0;\r'
+  line 003: b'!UID16.LED.CMS.WARM=1800;\r'
+  line 004: b'!UID16.LED.CMS.COOL=4000;\r'
+  line 005: b'!DONE,0\r'
+  line 006: b''
+
+[837659.776] === MANUAL COMMAND TESTS ===
+[837659.776] TX >>> b'#2.1.1.LED=ON;\r\n'
+[837661.276] RX <<< b'#2.1.1.LED=ON(TELNET);\r\n'
+[837661.576] TX >>> b'#2.1.1.LED.VALUE=120;\r\n'
+[837663.077] RX <<< b'#2.1.1.LED.VALUE=120;\r\n'
+[837663.378] TX >>> b'#2.1.1.LED=OFF;\r\n'
+[837664.878] RX <<< b'#2.1.1.LED=OFF(TELNET);\r\n#0.0.0.LED.VALUE=?;\r\n'
+[837665.178] TX >>> b'#2.1.0.LED=ON;\r\n'
+[837666.679] RX <<< b'#2.1.0.LED=ON(TELNET);\r\n'
+[837666.979] TX >>> b'#2.1.0.LED=OFF;\r\n'
+[837668.480] RX <<< b'#2.1.0.LED=OFF(TELNET);\r\n'
+
+[837668.780] Done.

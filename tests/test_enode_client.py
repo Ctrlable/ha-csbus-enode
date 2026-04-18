@@ -137,8 +137,10 @@ async def test_disconnect(client: ENodeClient) -> None:
     mock_writer.wait_closed = AsyncMock()
     mock_recv = MagicMock()
     mock_recv.cancel = MagicMock()
+    mock_recv.done.return_value = False
     mock_keep = MagicMock()
     mock_keep.cancel = MagicMock()
+    mock_keep.done.return_value = False
 
     client._writer = mock_writer
     client._connected = True
