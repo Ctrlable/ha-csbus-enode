@@ -129,6 +129,7 @@ class CSBusLight(CoordinatorEntity, LightEntity):  # type: ignore[misc]
             name=self._device["alias"],
             manufacturer="Converging Systems",
             model=self._device.get("type_name", "ILC"),
+            configuration_url=f"http://{self.coordinator.client.host}",
         )
 
     # ------------------------------------------------------------------

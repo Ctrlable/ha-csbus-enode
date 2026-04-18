@@ -110,6 +110,7 @@ class CSBusCover(CoordinatorEntity, CoverEntity):  # type: ignore[misc]
             name=self._device["alias"].rsplit(" Ch ", 1)[0] if " Ch " in self._device["alias"] else self._device["alias"],
             manufacturer="Converging Systems",
             model=self._device.get("type_name", "IMC"),
+            configuration_url=f"http://{self.coordinator.client.host}",
         )
 
     # ------------------------------------------------------------------

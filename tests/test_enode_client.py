@@ -105,7 +105,7 @@ async def test_send_command_when_connected(client: ENodeClient) -> None:
     result = await client.async_send_command("2.1.1", "LED", "ON")
 
     assert result is True
-    mock_writer.write.assert_called_once_with(b"#2.1.1.LED=ON;\r")
+    mock_writer.write.assert_called_once_with(b"#2.1.1.LED=ON;\r\n")
 
 
 @pytest.mark.asyncio
@@ -128,7 +128,7 @@ async def test_send_item_command(client: ENodeClient) -> None:
     result = await client.async_send_item_command("2.1.1", "LED", "DISSOLVE.1", "3")
 
     assert result is True
-    mock_writer.write.assert_called_once_with(b"#2.1.1.LED.DISSOLVE.1=3;\r")
+    mock_writer.write.assert_called_once_with(b"#2.1.1.LED.DISSOLVE.1=3;\r\n")
 
 
 @pytest.mark.asyncio

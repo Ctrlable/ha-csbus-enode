@@ -37,6 +37,7 @@ CONNECT_TIMEOUT = 10.0
 COMMAND_TIMEOUT = 5.0
 KEEPALIVE_INTERVAL = 30.0  # seconds between keepalive pings
 RECONNECT_DELAY = 5.0
+DISCOVER_TIMEOUT = 20.0  # DALI buses enumerate sequentially — needs longer window
 
 # Response category prefixes
 CAT_POSITIVE = "!"   # positive / unsolicited
@@ -64,6 +65,24 @@ def _strip_telnet_negotiation(data: bytes) -> bytes:
         out.append(data[i])
         i += 1
     return bytes(out)
+
+
+def _split_messages(buf: bytes) -> tuple[list[str], bytes]:
+    """
+    Split receive buffer into complete messages and a leftover fragment.
+    Messages end with: \\r\\n, ;\\r\\n, ;\\r, or ;\\n
+    Returns (list_of_clean_strings, remaining_bytes).
+    """
+    messages: list[str] = []
+    text = buf.decode("ascii", errors="ignore")
+    parts = re.split(r";?\r\n|;\r(?!\n)|;\n", text)
+    complete = parts[:-1]
+    leftover = parts[-1]
+    for part in complete:
+        cleaned = part.strip().rstrip(";").strip()
+        if cleaned:
+            messages.append(cleaned)
+    return messages, leftover.encode("ascii", errors="ignore")
 
 
 class ENodeClient:
@@ -142,20 +161,20 @@ class ENodeClient:
 
     async def async_send_command(self, zgn: str, device: str, command: str) -> bool:
         """
-        Send a command: #Z.G.N.DEVICE=COMMAND;\\r
+        Send a command: #Z.G.N.DEVICE=COMMAND;\\r\\n
         e.g. async_send_command("2.1.1", "LED", "ON")
         """
-        msg = f"#{zgn}.{device}={command};\r"
+        msg = f"#{zgn}.{device}={command};\r\n"
         return await self._send_raw(msg)
 
     async def async_send_item_command(
         self, zgn: str, device: str, item: str, command: str
     ) -> bool:
         """
-        Send a command with item: #Z.G.N.DEVICE.ITEM=COMMAND;\\r
+        Send a command with item: #Z.G.N.DEVICE.ITEM=COMMAND;\\r\\n
         e.g. async_send_item_command("2.1.1", "LED", "DISSOLVE.1", "3")
         """
-        msg = f"#{zgn}.{device}.{item}={command};\r"
+        msg = f"#{zgn}.{device}.{item}={command};\r\n"
         return await self._send_raw(msg)
 
     async def async_query(self, zgn: str, device: str, item: str) -> str | None:
@@ -163,13 +182,13 @@ class ENodeClient:
         Send a query and return the response value string, or None on timeout.
         e.g. async_query("2.1.1", "LED", "COLOR") -> "120.200.180"
         """
-        msg = f"#{zgn}.{device}.{item}=?;\r"
+        msg = f"#{zgn}.{device}.{item}=?;\r\n"
         response_event = asyncio.Event()
         response_value: list[str] = []
 
-        # Build a pattern that matches the positive response for this query
+        # Match positive response; trailing ';' already stripped by _split_messages
         pattern = re.compile(
-            rf"^!{re.escape(zgn)}\.{re.escape(device)}\.{re.escape(item)}=(.+);",
+            rf"^!{re.escape(zgn)}\.{re.escape(device)}\.{re.escape(item)}=(.+)",
             re.IGNORECASE,
         )
 
@@ -203,84 +222,88 @@ class ENodeClient:
         done_event = asyncio.Event()
 
         def _on_msg(line: str) -> None:
-            # +UID102;  -> newly found device
-            m = re.match(r"^\+UID(\d+);?$", line, re.IGNORECASE)
+            # +UID102  -> newly found device
+            m = re.match(r"^\+UID(\w+)$", line, re.IGNORECASE)
             if m:
                 uid = m.group(1)
                 if uid not in devices_raw:
                     devices_raw[uid] = {"uid": uid}
                 return
 
-            # !UID102.TYPE=ILC400CE;
-            m = re.match(r"^!UID(\d+)\.TYPE=(.+);?$", line, re.IGNORECASE)
+            # !UID102.TYPE=ILC400CE
+            m = re.match(r"^!UID(\w+)\.TYPE=(.+)$", line, re.IGNORECASE)
             if m:
                 uid, val = m.group(1), m.group(2)
                 devices_raw.setdefault(uid, {"uid": uid})["type"] = val
                 return
 
-            # !UID102.FORM=0,X,LIGHT,HSV,FALSE;
-            m = re.match(r"^!UID(\d+)\.FORM=(.+);?$", line, re.IGNORECASE)
+            # !UID102.FORM=0,X,LIGHT,HSV,FALSE
+            m = re.match(r"^!UID(\w+)\.FORM=(.+)$", line, re.IGNORECASE)
             if m:
                 uid, val = m.group(1), m.group(2)
                 devices_raw.setdefault(uid, {"uid": uid})["form"] = val
                 return
 
-            # !UID102.ALIAS=THEATER LIGHTS;
-            m = re.match(r"^!UID(\d+)\.ALIAS=(.+);?$", line, re.IGNORECASE)
+            # !UID102.ALIAS=THEATER LIGHTS
+            m = re.match(r"^!UID(\w+)\.ALIAS=(.+)$", line, re.IGNORECASE)
             if m:
                 uid, val = m.group(1), m.group(2)
                 devices_raw.setdefault(uid, {"uid": uid})["alias"] = val
                 return
 
-            # !UID102.A.ALIAS=SCREEN;  (motor channel alias)
-            m = re.match(r"^!UID(\d+)\.([A-D])\.ALIAS=(.+);?$", line, re.IGNORECASE)
+            # !UID102.A.ALIAS=SCREEN  (motor channel alias)
+            m = re.match(r"^!UID(\w+)\.([A-D])\.ALIAS=(.+)$", line, re.IGNORECASE)
             if m:
                 uid, ch, val = m.group(1), m.group(2).upper(), m.group(3)
                 d = devices_raw.setdefault(uid, {"uid": uid})
                 d.setdefault("channel_aliases", {})[ch] = val
                 return
 
-            # !UID102.BUS.ADDRESS=4.1.2;
-            m = re.match(r"^!UID(\d+)\.BUS\.ADDRESS=(.+);?$", line, re.IGNORECASE)
+            # !UID102.BUS.ADDRESS=4.1.2
+            m = re.match(r"^!UID(\w+)\.BUS\.ADDRESS=(.+)$", line, re.IGNORECASE)
             if m:
                 uid, val = m.group(1), m.group(2)
                 devices_raw.setdefault(uid, {"uid": uid})["address"] = val
                 return
 
-            # !UID102.A.BUS.ADDRESS=1.1.1;  (motor channel address)
-            m = re.match(r"^!UID(\d+)\.([A-D])\.BUS\.ADDRESS=(.+);?$", line, re.IGNORECASE)
+            # !UID102.A.BUS.ADDRESS=1.1.1  (motor channel address)
+            m = re.match(r"^!UID(\w+)\.([A-D])\.BUS\.ADDRESS=(.+)$", line, re.IGNORECASE)
             if m:
                 uid, ch, val = m.group(1), m.group(2).upper(), m.group(3)
                 d = devices_raw.setdefault(uid, {"uid": uid})
                 d.setdefault("channel_addresses", {})[ch] = val
                 return
 
-            # !UID102.LED.CMS.WARM=1700;
-            m = re.match(r"^!UID(\d+)\.LED\.CMS\.WARM=(\d+);?$", line, re.IGNORECASE)
+            # !UID102.LED.CMS.WARM=1700
+            m = re.match(r"^!UID(\w+)\.LED\.CMS\.WARM=(\d+)$", line, re.IGNORECASE)
             if m:
                 uid, val = m.group(1), int(m.group(2))
                 devices_raw.setdefault(uid, {"uid": uid})["cct_warm"] = val
                 return
 
-            # !UID102.LED.CMS.COOL=6500;
-            m = re.match(r"^!UID(\d+)\.LED\.CMS\.COOL=(\d+);?$", line, re.IGNORECASE)
+            # !UID102.LED.CMS.COOL=6500
+            m = re.match(r"^!UID(\w+)\.LED\.CMS\.COOL=(\d+)$", line, re.IGNORECASE)
             if m:
                 uid, val = m.group(1), int(m.group(2))
                 devices_raw.setdefault(uid, {"uid": uid})["cct_cool"] = val
                 return
 
             # !DONE,n  -> discovery complete
-            if re.match(r"^!DONE,\d+;?$", line, re.IGNORECASE):
+            if re.match(r"^!DONE,\d+$", line, re.IGNORECASE):
                 done_event.set()
 
         remove = self.add_listener(_on_msg)
         try:
-            await self._send_raw("DISCOVER\r")
-            # Wait up to 15 s; e-Node may not send !DONE on older firmware
+            await self._send_raw(">DISCOVER\r\n")
+            # Wait up to DISCOVER_TIMEOUT; e-Node may not send !DONE on older firmware
             try:
-                await asyncio.wait_for(done_event.wait(), timeout=15.0)
+                await asyncio.wait_for(done_event.wait(), timeout=DISCOVER_TIMEOUT)
             except TimeoutError:
-                _LOGGER.debug("DISCOVER: no !DONE received, using accumulated data")
+                _LOGGER.debug(
+                    "DISCOVER: no !DONE after %ss — using %d device(s) collected so far",
+                    DISCOVER_TIMEOUT,
+                    len(devices_raw),
+                )
         finally:
             remove()
 
@@ -352,11 +375,11 @@ class ENodeClient:
         text = buf.decode("ascii", errors="ignore")
         if "User" in text or "user" in text:
             _LOGGER.debug("e-Node requesting authentication")
-            self._writer.write(f"{self.username}\r".encode())
+            self._writer.write(f"{self.username}\r\n".encode())
             await self._writer.drain()
             # wait for Password prompt
             await asyncio.sleep(0.5)
-            self._writer.write(f"{self.password}\r".encode())
+            self._writer.write(f"{self.password}\r\n".encode())
             await self._writer.drain()
             # consume "Connected:" line
             with contextlib.suppress(TimeoutError):
@@ -368,24 +391,15 @@ class ENodeClient:
         buf = b""
         while self._connected:
             try:
-                chunk = await asyncio.wait_for(self._reader.read(1024), timeout=60.0)
+                chunk = await asyncio.wait_for(self._reader.read(4096), timeout=60.0)
                 if not chunk:
-                    _LOGGER.warning("e-Node connection closed by remote")
+                    _LOGGER.warning("e-Node: connection closed by remote")
                     break
                 buf += _strip_telnet_negotiation(chunk)
-                # split on ; or \r\n
-                while True:
-                    for sep in (b";\r", b";\n", b";"):
-                        idx = buf.find(sep)
-                        if idx != -1:
-                            line = buf[:idx + 1].decode("ascii", errors="ignore").strip()
-                            buf = buf[idx + len(sep):]
-                            if line:
-                                _LOGGER.debug("e-Node RX: %s", line)
-                                self._dispatch(line)
-                            break
-                    else:
-                        break
+                messages, buf = _split_messages(buf)
+                for msg in messages:
+                    _LOGGER.debug("e-Node RX: %s", msg)
+                    self._dispatch(msg)
             except TimeoutError:
                 continue
             except (OSError, ConnectionResetError) as exc:
@@ -408,7 +422,7 @@ class ENodeClient:
             await asyncio.sleep(KEEPALIVE_INTERVAL)
             if self._connected:
                 # Query the e-Node firmware version as a keepalive
-                await self._send_raw("#0.0.0.LED=STATUS;\r")
+                await self._send_raw("#0.0.0.LED.VALUE=?;\r\n")
 
     async def _reconnect(self) -> None:
         """Attempt to re-establish connection after a disconnect."""
