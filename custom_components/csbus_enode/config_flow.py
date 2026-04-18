@@ -14,10 +14,12 @@ from homeassistant.data_entry_flow import FlowResult
 
 from .const import (
     CONF_DEFAULT_TRANSITION,
+    CONF_MANUAL_NODES,
     CONF_PASSWORD,
     CONF_PORT,
     CONF_SCAN_INTERVAL,
     CONF_USERNAME,
+    DEFAULT_MANUAL_NODES,
     DEFAULT_PASSWORD,
     DEFAULT_PORT,
     DEFAULT_SCAN_INTERVAL,
@@ -65,6 +67,7 @@ class CSBusENodeConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):  # type: i
                             CONF_PORT: port,
                             CONF_USERNAME: username,
                             CONF_PASSWORD: password,
+                            CONF_MANUAL_NODES: user_input.get(CONF_MANUAL_NODES, DEFAULT_MANUAL_NODES),
                         },
                     )
             except TimeoutError:
@@ -82,6 +85,7 @@ class CSBusENodeConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):  # type: i
                 ),
                 vol.Optional(CONF_USERNAME, default=DEFAULT_USERNAME): str,
                 vol.Optional(CONF_PASSWORD, default=DEFAULT_PASSWORD): str,
+                vol.Optional(CONF_MANUAL_NODES, default=DEFAULT_MANUAL_NODES): str,
             }
         )
 
@@ -129,6 +133,13 @@ class CSBusENodeOptionsFlow(config_entries.OptionsFlow):  # type: ignore[misc]
                         CONF_DEFAULT_TRANSITION, DEFAULT_TRANSITION
                     ),
                 ): vol.All(int, vol.Range(min=0, max=60)),
+                vol.Optional(
+                    CONF_MANUAL_NODES,
+                    default=self.config_entry.options.get(
+                        CONF_MANUAL_NODES,
+                        self.config_entry.data.get(CONF_MANUAL_NODES, DEFAULT_MANUAL_NODES),
+                    ),
+                ): str,
             }
         )
 

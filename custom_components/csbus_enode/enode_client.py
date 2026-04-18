@@ -28,6 +28,33 @@ FORM field positions:
   [3] color space    (HSV, MONO)
   [4] CCT support    (TRUE / FALSE)
 
+DISCOVER returning !DONE,0
+---------------------------
+There are two causes of !DONE,0:
+  1. Timing race — the e-Node is mid-poll-cycle when DISCOVER arrives and
+     immediately closes the enumeration.  One retry after a short delay
+     usually recovers from this.
+  2. DALI bus crash — the ILC-DALI controller is unresponsive so the
+     e-Node has no devices to enumerate.  !DONE,0 arrives within ~1 s.
+     Retries will not help; configure manual_nodes as the fallback.
+
+async_discover detects a quick !DONE,0 (< DISCOVER_QUICK_DONE_THRESHOLD)
+and skips further retries when the bus fault pattern is recognised, rather
+than waiting through the full retry cycle.
+
+DALI state feedback
+--------------------
+This firmware does NOT send NOTIFY push for DALI buses.  The wildcard
+  #0.0.0.LED.NOTIFY=VALUE;\r\n
+is sent on connect (harmless) but produces no unsolicited responses.
+DALI query responses (#Z.G.N.LED.VALUE=?  →  #Z.G.N.LED.VALUE=?) echo the
+query back as a '#' message, not a '!' push, so async_query always times out.
+
+The only real-time feedback available is the command echo:
+  #Z.G.N.LED=ON(TELNET)  /  #Z.G.N.LED=OFF(TELNET)
+produced when a specific node (non-wildcard) executes the command.
+ENodeCoordinator.handle_notify parses these for ON/OFF state.
+
 IMPORTANT parser notes
 -----------------------
 The receive loop splits on \\r\\n (line-based) — NOT only on semicolons.
@@ -50,7 +77,8 @@ CONNECT_TIMEOUT = 10.0
 COMMAND_TIMEOUT = 5.0
 KEEPALIVE_INTERVAL = 45.0
 RECONNECT_DELAY = 5.0
-DISCOVER_TIMEOUT = 30.0   # DALI buses can be slow — live test showed 16 s response time
+DISCOVER_TIMEOUT = 30.0        # DALI buses can be slow — live test showed 16 s response time
+DISCOVER_QUICK_DONE_THRESHOLD = 2.0  # !DONE,0 within this many seconds → likely bus fault, not race
 
 # Bus type constants (FORM field position 1)
 BUS_CSBUS = "I"
@@ -175,6 +203,13 @@ class ENodeClient:
             self._keepalive_task = asyncio.create_task(
                 self._keepalive_loop(), name="enode_keepalive"
             )
+            # Enable push notifications for CS-Bus and DMX devices.
+            # For DALI buses this firmware ignores the NOTIFY command — no
+            # unsolicited '!' push messages will follow.  The only feedback
+            # available for DALI is the '#Z.G.N.LED=ON/OFF(TELNET)' command
+            # echo, which handle_notify parses separately.
+            await self._send_raw("#0.0.0.LED.NOTIFY=VALUE;\r\n")
+            await self._send_raw("#0.0.0.MOTOR.NOTIFY=ON;\r\n")
             _LOGGER.info("e-Node connected at %s (firmware year: %s)",
                          self.host, self._firmware_year or "unknown")
             return True
@@ -334,9 +369,20 @@ class ENodeClient:
                 done_event.set()
                 return
 
-        # Legacy e-Nodes (E-NODE/ADMIN firmware) may be mid-poll-cycle when
-        # DISCOVER is sent, causing an immediate !DONE,0 with no device data.
-        # A short settling delay and one retry recovers from this race.
+        # DISCOVER returning !DONE,0 has two causes:
+        #
+        #   Timing race: the e-Node is mid-poll-cycle and closes the
+        #   enumeration immediately.  !DONE,0 arrives after some latency
+        #   while the bus is queried (~1–8 s).  One retry after a short
+        #   settling delay usually recovers.
+        #
+        #   DALI bus crash: the ILC-DALI controller is unresponsive so
+        #   the e-Node has nothing to enumerate.  !DONE,0 arrives within
+        #   ~1 s (DISCOVER_QUICK_DONE_THRESHOLD).  Retrying is pointless;
+        #   the caller should use manual_nodes as the fallback instead.
+        #
+        # We distinguish the two by timing: a quick !DONE,0 skips further
+        # retries to avoid wasting startup time.
         _MAX_ATTEMPTS = 3
         _RETRY_DELAY  = 8.0
 
@@ -353,6 +399,7 @@ class ENodeClient:
                     done_event.clear()
 
                 # CRITICAL: the correct command is '>DISCOVER' not just 'DISCOVER'
+                t0 = asyncio.get_event_loop().time()
                 await self._send_raw(">DISCOVER\r\n")
                 try:
                     await asyncio.wait_for(done_event.wait(), timeout=DISCOVER_TIMEOUT)
@@ -364,6 +411,18 @@ class ENodeClient:
 
                 if devices_raw:
                     break  # found at least one device, no need to retry
+
+                elapsed = asyncio.get_event_loop().time() - t0
+                if elapsed < DISCOVER_QUICK_DONE_THRESHOLD:
+                    # !DONE,0 arrived almost instantly — DALI bus is likely crashed,
+                    # not a timing race.  Further retries won't help.
+                    _LOGGER.warning(
+                        "DISCOVER returned !DONE,0 in %.1fs — DALI bus may be crashed. "
+                        "Configure manual_nodes in integration options as fallback.",
+                        elapsed,
+                    )
+                    break
+
                 _LOGGER.debug("DISCOVER attempt %d returned 0 devices", attempt + 1)
         finally:
             remove()

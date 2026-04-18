@@ -16,7 +16,7 @@ import asyncio
 import sys
 import time
 
-HOST = sys.argv[1] if len(sys.argv) > 1 else "192.168.1.100"
+HOST = sys.argv[1] if len(sys.argv) > 1 else "172.16.1.88"
 PORT = int(sys.argv[2]) if len(sys.argv) > 2 else 23
 # Override with env vars if needed: DEBUG_USER / DEBUG_PASS
 import os

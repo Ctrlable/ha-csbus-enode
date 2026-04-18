@@ -287,19 +287,26 @@ class CSBusLight(CoordinatorEntity, LightEntity):  # type: ignore[misc]
         if ATTR_COLOR_TEMP_KELVIN in kwargs:
             cct = kwargs[ATTR_COLOR_TEMP_KELVIN]
             brightness = kwargs.get(ATTR_BRIGHTNESS)
-            await self._client.async_send_command(
-                self._address, CS_DEVICE_LED, f"CCT,{cct}{ramp}"
+            # Item form (.CCT=) confirmed working on DALI firmware.
+            await self._client.async_send_item_command(
+                self._address, CS_DEVICE_LED, "CCT", f"{cct}{ramp}"
             )
             upd: dict[str, Any] = {"is_on": True, "cct": cct}
             if brightness is not None:
-                upd["brightness_raw"] = _ha_to_cs(brightness)
+                level = _ha_to_cs(brightness)
+                # Send VALUE separately so the brightness level is actually applied.
+                await self._client.async_send_item_command(
+                    self._address, CS_DEVICE_LED, "VALUE", f"{level}{ramp}"
+                )
+                upd["brightness_raw"] = level
             self._push_optimistic(**upd)
             return
 
         if ATTR_BRIGHTNESS in kwargs:
             level = _ha_to_cs(kwargs[ATTR_BRIGHTNESS])
-            await self._client.async_send_command(
-                self._address, CS_DEVICE_LED, f"SET,{level}{ramp}"
+            # Item form (.VALUE=) confirmed working on DALI firmware.
+            await self._client.async_send_item_command(
+                self._address, CS_DEVICE_LED, "VALUE", f"{level}{ramp}"
             )
             self._push_optimistic(is_on=level > 0, brightness_raw=level)
             return
@@ -338,8 +345,9 @@ class CSBusLight(CoordinatorEntity, LightEntity):  # type: ignore[misc]
     async def async_set_circadian(self, level: int, transition: int | None = None) -> None:
         """Set circadian/SUN level (0-240, 0=night, 240=noon)."""
         ramp = f":{transition}" if transition is not None else ""
-        await self._client.async_send_command(
-            self._address, CS_DEVICE_LED, f"SUN,{level}{ramp}"
+        # Item form (.SUN=) confirmed working on DALI firmware.
+        await self._client.async_send_item_command(
+            self._address, CS_DEVICE_LED, "SUN", f"{level}{ramp}"
         )
 
     async def async_resume_circadian(self, max_level: int = 240) -> None:

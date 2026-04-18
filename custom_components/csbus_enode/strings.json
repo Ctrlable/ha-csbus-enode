@@ -9,12 +9,14 @@
           "name": "Gateway Name (optional)",
           "port": "Telnet Port (default 23)",
           "username": "Telnet Username",
-          "password": "Telnet Password"
+          "password": "Telnet Password",
+          "manual_nodes": "Manual ZGN Nodes (fallback if DISCOVER finds nothing)"
         },
         "data_description": {
           "host": "The IP address of your e-Node on the local network",
           "username": "Default is 'Telnet 1' (e-Node MKIII+)",
-          "password": "Default is 'Password 1' (e-Node MKIII+)"
+          "password": "Default is 'Password 1' (e-Node MKIII+)",
+          "manual_nodes": "Used when DISCOVER returns 0 devices. Format: RANGE[:bus[:colorspace[:cct[:warm_K[:cool_K]]]]]. Bus: D=DALI (default), X=DMX, I=CS-Bus. Colorspace: MONO (default), HSV. CCT: 0/1. Examples: '1.16.1-14' (DALI mono), '2.1.1-8:X:HSV' (DMX colour), '2.1.9-12:X:MONO:1' (DMX tunable-white). Space or comma separated."
         }
       }
     },
@@ -32,7 +34,8 @@
         "title": "e-Node Options",
         "data": {
           "scan_interval": "State poll interval (seconds)",
-          "default_transition": "Default light transition time (seconds)"
+          "default_transition": "Default light transition time (seconds)",
+          "manual_nodes": "Manual ZGN Nodes (fallback if DISCOVER finds nothing)"
         }
       }
     }
