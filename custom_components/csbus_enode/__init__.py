@@ -1,22 +1,45 @@
 """
 Converging Systems e-Node CS-Bus integration for Home Assistant.
 
-Sets up the Telnet connection, runs device discovery, and coordinates
-state updates for lights and covers.
+Architecture
+------------
+One config entry = one e-Node gateway (one Telnet connection).
+Multiple e-Nodes = multiple config entries.
+
+Device model
+------------
+DISCOVER returns one entry per CONTROLLABLE ADDRESS on the bus:
+  - CS-Bus:  one UID per ILC/IMC controller
+  - DMX:     one UID per DMX fixture (up to 32 per e-Node/dmx)
+  - DALI:    one ILC-DALI controller UID; each DALI fixture has its
+             own ZGN address (zone.group.DALI_address, e.g. 2.1.1..2.1.64)
+
+State updates
+-------------
+The integration uses NOTIFY push (listen mode) as primary — the e-Node
+broadcasts state changes on the bus automatically after any command.
+Polling is used only as a fallback and is deliberately rate-limited to
+avoid flooding the gateway (especially critical for DMX/DALI).
+
+Poll strategy:
+  - Polling is DISABLED by default (NOTIFY handles everything).
+  - When polling is enabled (configurable), we query ONE device every
+    POLL_STAGGER_DELAY seconds rather than all at once.
+  - DALI buses are never polled individually — they report via NOTIFY only.
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 from datetime import timedelta
 from typing import Any
 
-import voluptuous as vol
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import ATTR_ENTITY_ID, CONF_HOST, Platform
-from homeassistant.core import HomeAssistant, ServiceCall
-from homeassistant.helpers import config_validation as cv
+from homeassistant.const import Platform
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers.event import async_track_time_interval
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
 from .const import (
@@ -26,97 +49,36 @@ from .const import (
     CONF_USERNAME,
     DATA_CLIENT,
     DATA_COORDINATOR,
-    DATA_COVER_ENTITIES,
     DATA_DEVICES,
-    DATA_LIGHT_ENTITIES,
     DEFAULT_PASSWORD,
     DEFAULT_PORT,
     DEFAULT_SCAN_INTERVAL,
     DEFAULT_USERNAME,
-    DEVICE_CLASS_LIGHT,
-    DEVICE_CLASS_MOTOR,
     DOMAIN,
     PLATFORM_COVER,
     PLATFORM_LIGHT,
-    SERVICE_RECALL_PRESET,
-    SERVICE_RESUME_CIRCADIAN,
-    SERVICE_SET_CIRCADIAN,
-    SERVICE_SET_DISSOLVE,
-    SERVICE_STORE_PRESET,
 )
-from .enode_client import ENodeClient
+from .enode_client import ENodeClient, BUS_DALI, BUS_DMX
 
 _LOGGER = logging.getLogger(__name__)
 
-PLATFORMS = [Platform.LIGHT, Platform.COVER, Platform.SENSOR]
+PLATFORMS = [Platform.LIGHT, Platform.COVER]
 
-_ALL_SERVICES = [
-    SERVICE_RECALL_PRESET,
-    SERVICE_STORE_PRESET,
-    SERVICE_SET_CIRCADIAN,
-    SERVICE_RESUME_CIRCADIAN,
-    SERVICE_SET_DISSOLVE,
-]
+# Time between individual device polls to avoid flooding the gateway.
+# At 0.5 s/device, 30 DMX fixtures = 15 s total — well within a 30 s interval.
+POLL_STAGGER_DELAY = 0.5   # seconds between each device query
 
-# ---------------------------------------------------------------------------
-# Service schemas
-# ---------------------------------------------------------------------------
-
-_SCHEMA_RECALL_PRESET = vol.Schema(
-    {
-        vol.Optional(ATTR_ENTITY_ID): cv.entity_ids,
-        vol.Required("preset"): vol.All(vol.Coerce(int), vol.Range(min=0, max=24)),
-        vol.Optional("transition"): vol.All(vol.Coerce(int), vol.Range(min=0)),
-    },
-    extra=vol.ALLOW_EXTRA,
-)
-
-_SCHEMA_STORE_PRESET = vol.Schema(
-    {
-        vol.Optional(ATTR_ENTITY_ID): cv.entity_ids,
-        vol.Required("preset"): vol.All(vol.Coerce(int), vol.Range(min=1, max=24)),
-    },
-    extra=vol.ALLOW_EXTRA,
-)
-
-_SCHEMA_SET_CIRCADIAN = vol.Schema(
-    {
-        vol.Optional(ATTR_ENTITY_ID): cv.entity_ids,
-        vol.Required("level"): vol.All(vol.Coerce(int), vol.Range(min=0, max=240)),
-        vol.Optional("transition"): vol.All(vol.Coerce(int), vol.Range(min=0)),
-    },
-    extra=vol.ALLOW_EXTRA,
-)
-
-_SCHEMA_RESUME_CIRCADIAN = vol.Schema(
-    {
-        vol.Optional(ATTR_ENTITY_ID): cv.entity_ids,
-        vol.Optional("max_level", default=240): vol.All(
-            vol.Coerce(int), vol.Range(min=0, max=240)
-        ),
-    },
-    extra=vol.ALLOW_EXTRA,
-)
-
-_SCHEMA_SET_DISSOLVE = vol.Schema(
-    {
-        vol.Optional(ATTR_ENTITY_ID): cv.entity_ids,
-        vol.Required("dissolve_index"): vol.All(vol.Coerce(int), vol.Range(min=0, max=4)),
-        vol.Required("seconds"): vol.All(vol.Coerce(float), vol.Range(min=0)),
-    },
-    extra=vol.ALLOW_EXTRA,
-)
-
-
-# ---------------------------------------------------------------------------
-# Setup / teardown
-# ---------------------------------------------------------------------------
+# DALI and DMX gateways must never be flooded — if the scan_interval is
+# very short, clamp it to this minimum.
+MIN_SCAN_INTERVAL_DMX  = 60   # seconds
+MIN_SCAN_INTERVAL_DALI = 60
+MIN_SCAN_INTERVAL_CSBUS = 30
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up the e-Node integration from a config entry."""
-    host = entry.data[CONF_HOST]
-    port = entry.data.get(CONF_PORT, DEFAULT_PORT)
+    host     = entry.data["host"]
+    port     = entry.data.get(CONF_PORT, DEFAULT_PORT)
     username = entry.data.get(CONF_USERNAME, DEFAULT_USERNAME)
     password = entry.data.get(CONF_PASSWORD, DEFAULT_PASSWORD)
     scan_interval = entry.options.get(CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL)
@@ -127,264 +89,163 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         _LOGGER.error("Failed to connect to e-Node at %s", host)
         return False
 
-    # Enable push notifications so the e-Node reports state changes immediately
-    await client.async_send_command("0.0.0", "LED", "NOTIFY=VALUE")
-    await client.async_send_command("0.0.0", "MOTOR", "NOTIFY=ON")
+    # Run DISCOVER — returns normalised device dicts from enode_client
+    discovered = await client.async_discover()
+    _LOGGER.debug("e-Node raw discovery: %d device(s)", len(discovered))
 
-    # Run device discovery
-    raw_devices = await client.async_discover()
-    _LOGGER.debug("e-Node discovery returned %d raw devices", len(raw_devices))
+    # _parse_devices maps the normalised dicts to HA platform descriptors
+    devices = _parse_devices(discovered)
 
-    parsed_devices = _parse_devices(raw_devices)
+    n_lights = sum(1 for d in devices if d["platform"] == PLATFORM_LIGHT)
+    n_covers = sum(1 for d in devices if d["platform"] == PLATFORM_COVER)
     _LOGGER.info(
-        "e-Node discovered %d devices (%d lights, %d covers)",
-        len(parsed_devices),
-        sum(1 for d in parsed_devices if d["platform"] == PLATFORM_LIGHT),
-        sum(1 for d in parsed_devices if d["platform"] == PLATFORM_COVER),
+        "e-Node %s: %d device(s) — %d light(s), %d cover(s)",
+        host, len(devices), n_lights, n_covers,
     )
 
-    coordinator = ENodeCoordinator(hass, client, parsed_devices, scan_interval)
-    client.add_listener(coordinator.handle_message)
+    # Clamp scan_interval based on the bus types present
+    bus_types = {d.get("bus_type", "I") for d in devices}
+    if BUS_DMX in bus_types:
+        scan_interval = max(scan_interval, MIN_SCAN_INTERVAL_DMX)
+    if BUS_DALI in bus_types:
+        scan_interval = max(scan_interval, MIN_SCAN_INTERVAL_DALI)
+
+    coordinator = ENodeCoordinator(hass, client, devices, scan_interval)
+
+    # Register NOTIFY listener — all state updates arrive here for free
+    remove_listener = client.add_listener(coordinator.handle_notify)
 
     hass.data.setdefault(DOMAIN, {})
     hass.data[DOMAIN][entry.entry_id] = {
         DATA_CLIENT: client,
         DATA_COORDINATOR: coordinator,
-        DATA_DEVICES: parsed_devices,
-        DATA_LIGHT_ENTITIES: [],
-        DATA_COVER_ENTITIES: [],
+        DATA_DEVICES: devices,
+        "remove_listener": remove_listener,
     }
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
-
-    # Register domain services (idempotent — skipped if already registered)
-    _async_register_services(hass)
-
     entry.async_on_unload(entry.add_update_listener(_async_update_options))
     return True
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
-    """Unload the integration."""
-    unloaded: bool = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
+    """Unload the integration and close the Telnet connection."""
+    unloaded = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
     if unloaded:
-        data: dict[str, Any] = hass.data[DOMAIN].pop(entry.entry_id)
-        client: ENodeClient = data[DATA_CLIENT]
-        await client.async_disconnect()
-        # Remove services only when the last entry is gone
-        if not hass.data[DOMAIN]:
-            for svc in _ALL_SERVICES:
-                hass.services.async_remove(DOMAIN, svc)
+        data = hass.data[DOMAIN].pop(entry.entry_id)
+        data.get("remove_listener", lambda: None)()
+        await data[DATA_CLIENT].async_disconnect()
     return unloaded
 
 
 async def _async_update_options(hass: HomeAssistant, entry: ConfigEntry) -> None:
-    """Reload when options change."""
     await hass.config_entries.async_reload(entry.entry_id)
 
 
 # ---------------------------------------------------------------------------
-# Service registration
+# Device parsing
 # ---------------------------------------------------------------------------
-
-
-def _get_entity_ids_from_call(call: ServiceCall) -> set[str]:
-    raw = call.data.get(ATTR_ENTITY_ID)
-    if isinstance(raw, list):
-        return set(raw)
-    if isinstance(raw, str):
-        return {raw}
-    return set()
-
-
-def _async_register_services(hass: HomeAssistant) -> None:
-    """Register all custom CS-Bus services (no-op if already registered)."""
-    if hass.services.has_service(DOMAIN, SERVICE_RECALL_PRESET):
-        return
-
-    async def _handle_recall_preset(call: ServiceCall) -> None:
-        entity_ids = _get_entity_ids_from_call(call)
-        preset: int = int(call.data["preset"])
-        transition: int | None = (
-            int(call.data["transition"]) if "transition" in call.data else None
-        )
-        for entry_data in hass.data.get(DOMAIN, {}).values():
-            for entity in entry_data.get(DATA_LIGHT_ENTITIES, []):
-                if entity.entity_id in entity_ids:
-                    await entity.async_recall_preset(preset, transition)
-            for entity in entry_data.get(DATA_COVER_ENTITIES, []):
-                if entity.entity_id in entity_ids:
-                    await entity.async_recall_preset(preset)
-
-    async def _handle_store_preset(call: ServiceCall) -> None:
-        entity_ids = _get_entity_ids_from_call(call)
-        preset: int = int(call.data["preset"])
-        for entry_data in hass.data.get(DOMAIN, {}).values():
-            for entity in entry_data.get(DATA_LIGHT_ENTITIES, []):
-                if entity.entity_id in entity_ids:
-                    await entity.async_store_preset(preset)
-            for entity in entry_data.get(DATA_COVER_ENTITIES, []):
-                if entity.entity_id in entity_ids:
-                    await entity.async_store_preset(preset)
-
-    async def _handle_set_circadian(call: ServiceCall) -> None:
-        entity_ids = _get_entity_ids_from_call(call)
-        level: int = int(call.data["level"])
-        transition: int | None = (
-            int(call.data["transition"]) if "transition" in call.data else None
-        )
-        for entry_data in hass.data.get(DOMAIN, {}).values():
-            for entity in entry_data.get(DATA_LIGHT_ENTITIES, []):
-                if entity.entity_id in entity_ids:
-                    await entity.async_set_circadian(level, transition)
-
-    async def _handle_resume_circadian(call: ServiceCall) -> None:
-        entity_ids = _get_entity_ids_from_call(call)
-        max_level: int = int(call.data.get("max_level", 240))
-        for entry_data in hass.data.get(DOMAIN, {}).values():
-            for entity in entry_data.get(DATA_LIGHT_ENTITIES, []):
-                if entity.entity_id in entity_ids:
-                    await entity.async_resume_circadian(max_level)
-
-    async def _handle_set_dissolve(call: ServiceCall) -> None:
-        entity_ids = _get_entity_ids_from_call(call)
-        dissolve_index: int = int(call.data["dissolve_index"])
-        seconds: float = float(call.data["seconds"])
-        for entry_data in hass.data.get(DOMAIN, {}).values():
-            for entity in entry_data.get(DATA_LIGHT_ENTITIES, []):
-                if entity.entity_id in entity_ids:
-                    await entity.async_set_dissolve(dissolve_index, seconds)
-
-    hass.services.async_register(
-        DOMAIN, SERVICE_RECALL_PRESET, _handle_recall_preset, schema=_SCHEMA_RECALL_PRESET
-    )
-    hass.services.async_register(
-        DOMAIN, SERVICE_STORE_PRESET, _handle_store_preset, schema=_SCHEMA_STORE_PRESET
-    )
-    hass.services.async_register(
-        DOMAIN, SERVICE_SET_CIRCADIAN, _handle_set_circadian, schema=_SCHEMA_SET_CIRCADIAN
-    )
-    hass.services.async_register(
-        DOMAIN,
-        SERVICE_RESUME_CIRCADIAN,
-        _handle_resume_circadian,
-        schema=_SCHEMA_RESUME_CIRCADIAN,
-    )
-    hass.services.async_register(
-        DOMAIN, SERVICE_SET_DISSOLVE, _handle_set_dissolve, schema=_SCHEMA_SET_DISSOLVE
-    )
-
-
-# ---------------------------------------------------------------------------
-# Device parsing helpers
-# ---------------------------------------------------------------------------
-
 
 def _parse_devices(raw: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Convert raw discovery dicts into normalized device descriptors."""
+    """
+    Convert normalised DISCOVER dicts (from enode_client._normalise_device)
+    into HA platform descriptors.
+
+    enode_client already handles the FORM parsing and normalisation.
+    Here we just map platform="light"/"cover" and handle multi-channel motors.
+
+    Key mapping (enode_client output → what we store):
+      platform     → "light" or "cover"
+      device_class → "LIGHT" or "MOTOR"
+      uid          → unique_id suffix
+      alias        → entity name
+      address      → ZGN string for commands
+      color_space  → "HSV" or "MONO"
+      cct_support  → bool
+      bus_type     → "I", "X", or "D"
+    """
     devices: list[dict[str, Any]] = []
+
     for d in raw:
-        form_str = d.get("form", "")
-        form = _parse_form(form_str)
-        device_class = form.get("type", "").upper()
+        platform     = d.get("platform", "light")
+        device_class = d.get("device_class", "LIGHT")
 
-        if device_class == DEVICE_CLASS_LIGHT:
-            devices.append(
-                {
-                    "uid": d.get("uid", ""),
-                    "alias": d.get("alias", f"CS-Bus Light {d.get('uid','')}"),
-                    "address": d.get("address", "2.1.0"),
-                    "platform": PLATFORM_LIGHT,
-                    "device_class": device_class,
-                    "color_space": form.get("color_space", "MONO"),
-                    "cct_support": form.get("cct_support", False),
-                    "cct_warm": d.get("cct_warm", 2700),
-                    "cct_cool": d.get("cct_cool", 6500),
-                    "channels": form.get("channels", 1),
-                    "bus_type": form.get("bus_type", "I"),
-                    "type_name": d.get("type", "ILC"),
-                }
-            )
+        if platform == PLATFORM_LIGHT:
+            devices.append({
+                "uid":         d["uid"],
+                "alias":       d.get("alias", f"Light {d['uid']}"),
+                "address":     d.get("address", "2.1.1"),
+                "platform":    PLATFORM_LIGHT,
+                "device_class": device_class,
+                "color_space": d.get("color_space", "MONO"),
+                "cct_support": d.get("cct_support", False),
+                "cct_warm":    d.get("cct_warm", 2700),
+                "cct_cool":    d.get("cct_cool", 6500),
+                "channels":    d.get("channels", 1),
+                "bus_type":    d.get("bus_type", "I"),
+                "type_name":   d.get("type_name", "ILC"),
+            })
 
-        elif device_class == DEVICE_CLASS_MOTOR:
-            channel_aliases: dict[str, str] = d.get("channel_aliases", {})
-            channel_addresses: dict[str, str] = d.get("channel_addresses", {})
-            n_channels = form.get("channels", 1)
+        elif platform == PLATFORM_COVER:
+            channel_addresses = d.get("channel_addresses", {})
+            channel_aliases   = d.get("channel_aliases", {})
 
             if channel_addresses:
+                # IMC-300 multi-channel: one cover entity per channel
                 for ch, addr in channel_addresses.items():
-                    devices.append(
-                        {
-                            "uid": f"{d.get('uid', '')}_{ch}",
-                            "alias": channel_aliases.get(
-                                ch, f"CS-Bus Motor {d.get('uid','')} Ch {ch}"
-                            ),
-                            "address": addr,
-                            "platform": PLATFORM_COVER,
-                            "device_class": device_class,
-                            "color_space": None,
-                            "cct_support": False,
-                            "cct_warm": None,
-                            "cct_cool": None,
-                            "channels": 1,
-                            "bus_type": form.get("bus_type", "I"),
-                            "type_name": d.get("type", "IMC"),
-                            "parent_uid": d.get("uid", ""),
-                        }
-                    )
-            else:
-                devices.append(
-                    {
-                        "uid": d.get("uid", ""),
-                        "alias": d.get("alias", f"CS-Bus Motor {d.get('uid','')}"),
-                        "address": d.get("address", "1.1.0"),
-                        "platform": PLATFORM_COVER,
+                    devices.append({
+                        "uid":         f"{d['uid']}_{ch}",
+                        "alias":       channel_aliases.get(ch, f"{d.get('alias', 'Motor')} Ch {ch}"),
+                        "address":     addr,
+                        "platform":    PLATFORM_COVER,
                         "device_class": device_class,
                         "color_space": None,
                         "cct_support": False,
-                        "cct_warm": None,
-                        "cct_cool": None,
-                        "channels": n_channels,
-                        "bus_type": form.get("bus_type", "I"),
-                        "type_name": d.get("type", "IMC"),
-                    }
-                )
+                        "cct_warm":    None,
+                        "cct_cool":    None,
+                        "channels":    1,
+                        "bus_type":    d.get("bus_type", "I"),
+                        "type_name":   d.get("type_name", "IMC"),
+                        "parent_uid":  d["uid"],
+                    })
+            else:
+                devices.append({
+                    "uid":         d["uid"],
+                    "alias":       d.get("alias", f"Motor {d['uid']}"),
+                    "address":     d.get("address", "1.1.1"),
+                    "platform":    PLATFORM_COVER,
+                    "device_class": device_class,
+                    "color_space": None,
+                    "cct_support": False,
+                    "cct_warm":    None,
+                    "cct_cool":    None,
+                    "channels":    d.get("channels", 1),
+                    "bus_type":    d.get("bus_type", "I"),
+                    "type_name":   d.get("type_name", "IMC"),
+                })
+
+        else:
+            _LOGGER.debug("Skipping unknown platform device: %s", d)
 
     return devices
-
-
-def _parse_form(form_str: str) -> dict[str, Any]:
-    """Parse FORM=channels,bus,type,colorspace,cct string."""
-    parts = [p.strip() for p in form_str.split(",")]
-    result: dict[str, Any] = {}
-    if len(parts) >= 1:
-        try:
-            result["channels"] = int(parts[0])
-        except ValueError:
-            result["channels"] = 1
-    if len(parts) >= 2:
-        result["bus_type"] = parts[1].upper()
-    if len(parts) >= 3:
-        result["type"] = parts[2].upper()
-    if len(parts) >= 4:
-        result["color_space"] = parts[3].upper()
-    if len(parts) >= 5:
-        result["cct_support"] = parts[4].upper() == "TRUE"
-    return result
 
 
 # ---------------------------------------------------------------------------
 # Coordinator
 # ---------------------------------------------------------------------------
 
-
-class ENodeCoordinator(DataUpdateCoordinator):  # type: ignore[misc]
+class ENodeCoordinator(DataUpdateCoordinator):
     """
-    Manages state for all CS-Bus devices.
+    State coordinator for all CS-Bus/DMX/DALI devices on one e-Node.
 
-    Handles both:
-    - NOTIFY push messages (Change of Value) from the e-Node
-    - Periodic polling as fallback
+    Primary method: NOTIFY push (listen mode).
+      The e-Node sends unsolicited state updates after any command.
+      No polling needed for devices with NOTIFY enabled.
+
+    Fallback: Staggered polling.
+      Queries devices one at a time with a delay between each to avoid
+      flooding the gateway — critical for DMX (max 32 fixtures) and
+      DALI (max 64 fixtures) which have limited command bandwidth.
     """
 
     def __init__(
@@ -397,127 +258,167 @@ class ENodeCoordinator(DataUpdateCoordinator):  # type: ignore[misc]
         super().__init__(
             hass,
             _LOGGER,
-            name=DOMAIN,
+            name=f"{DOMAIN}_{client.host}",
             update_interval=timedelta(seconds=scan_interval),
         )
-        self.client = client
+        self.client  = client
         self.devices = devices
-        self.firmware_version: str | None = None
-        # State cache: address -> {brightness, r, g, b, h, s, v, cct, sun, is_on, position}
+        # address → state dict
         self._state: dict[str, dict[str, Any]] = {}
+        # Index for staggered polling — rotate through devices one per cycle
+        self._poll_index = 0
 
     def get_state(self, address: str) -> dict[str, Any]:
-        """Return the current cached state for a device address."""
         return self._state.get(address, {})
 
-    def handle_message(self, line: str) -> None:
-        """Parse and cache an inbound e-Node message, then signal update."""
+    # ------------------------------------------------------------------
+    # NOTIFY handler — called for every inbound Telnet message
+    # ------------------------------------------------------------------
+
+    def handle_notify(self, line: str) -> None:
+        """
+        Parse an inbound e-Node message and update state cache.
+
+        Only '!' (positive/unsolicited) messages carry state.
+        '#' echoes and '*' errors are ignored.
+        """
+        line = line.strip().rstrip(";")
         if not line.startswith("!"):
             return
 
-        # LED.VALUE=R.G.B  or  LED.VALUE=W (monochrome)
-        m = re.match(r"^!(.+)\.LED\.VALUE=(.+);?$", line, re.IGNORECASE)
-        if m:
-            addr, val = m.group(1), m.group(2)
-            parts = val.split(".")
-            state = self._state.setdefault(addr, {})
-            if len(parts) >= 3:
-                state["r"] = int(parts[0])
-                state["g"] = int(parts[1])
-                state["b"] = int(parts[2])
-                if len(parts) == 4:
-                    state["w"] = int(parts[3])
-            elif len(parts) == 1:
-                state["brightness_raw"] = int(parts[0])
-            state["is_on"] = any(int(p) > 0 for p in parts)
-            self.async_set_updated_data(dict(self._state))
-            return
+        changed = False
 
-        # LED.COLOR=H.S.V
-        m = re.match(r"^!(.+)\.LED\.COLOR=(.+);?$", line, re.IGNORECASE)
+        # !Z.G.N.LED.VALUE=R.G.B  or  =W (mono)  or  =R.G.B.W (RGBW)
+        m = re.match(r"^!(.+?)\.LED\.VALUE=(.+)$", line, re.IGNORECASE)
         if m:
-            addr, val = m.group(1), m.group(2)
+            addr, val = m.group(1), m.group(2).rstrip(";")
+            state = self._state.setdefault(addr, {})
+            parts = val.split(".")
+            try:
+                if len(parts) >= 4:
+                    state.update(r=int(parts[0]), g=int(parts[1]),
+                                 b=int(parts[2]), w=int(parts[3]))
+                elif len(parts) == 3:
+                    state.update(r=int(parts[0]), g=int(parts[1]), b=int(parts[2]))
+                elif len(parts) == 1:
+                    state["brightness_raw"] = int(parts[0])
+                state["is_on"] = any(int(p) > 0 for p in parts)
+                changed = True
+            except (ValueError, IndexError):
+                pass
+
+        # !Z.G.N.LED.COLOR=H.S.V
+        m = re.match(r"^!(.+?)\.LED\.COLOR=(.+)$", line, re.IGNORECASE)
+        if m:
+            addr, val = m.group(1), m.group(2).rstrip(";")
             parts = val.split(".")
             if len(parts) == 3:
                 state = self._state.setdefault(addr, {})
-                state["h"] = int(parts[0])
-                state["s"] = int(parts[1])
-                state["v"] = int(parts[2])
-                state["is_on"] = int(parts[2]) > 0
-                self.async_set_updated_data(dict(self._state))
-            return
-
-        # LED.STATUS=sun,cct  (for CCT / circadian devices)
-        m = re.match(r"^!(.+)\.LED\.STATUS=(.+);?$", line, re.IGNORECASE)
-        if m:
-            addr, val = m.group(1), m.group(2)
-            parts = val.split(",")
-            if len(parts) >= 2:
-                state = self._state.setdefault(addr, {})
                 try:
+                    state.update(h=int(parts[0]), s=int(parts[1]), v=int(parts[2]))
+                    state["is_on"] = int(parts[2]) > 0
+                    changed = True
+                except (ValueError, IndexError):
+                    pass
+
+        # !Z.G.N.LED.STATUS=sun_val,cct_val  (CCT/circadian devices)
+        m = re.match(r"^!(.+?)\.LED\.STATUS=(.+)$", line, re.IGNORECASE)
+        if m:
+            addr, val = m.group(1), m.group(2).rstrip(";")
+            parts = val.split(",")
+            state = self._state.setdefault(addr, {})
+            try:
+                if len(parts) >= 2:
                     state["sun"] = int(parts[0])
                     state["cct"] = int(parts[1])
-                except ValueError:
-                    pass
-                self.async_set_updated_data(dict(self._state))
-            return
+                    changed = True
+            except (ValueError, IndexError):
+                pass
 
-        # MOTOR.POSITION=xx.xx
-        m = re.match(r"^!(.+)\.MOTOR\.POSITION=(.+);?$", line, re.IGNORECASE)
+        # !Z.G.N.MOTOR.POSITION=xx.xx
+        m = re.match(r"^!(.+?)\.MOTOR\.POSITION=(.+)$", line, re.IGNORECASE)
         if m:
-            addr, val = m.group(1), m.group(2)
+            addr, val = m.group(1), m.group(2).rstrip(";")
             try:
-                state = self._state.setdefault(addr, {})
-                state["position"] = float(val)
-                self.async_set_updated_data(dict(self._state))
+                self._state.setdefault(addr, {})["position"] = float(val)
+                changed = True
             except ValueError:
                 pass
-            return
 
-        # MOTOR.STATUS=OPEN/CLOSE/STOP/HOME/EXTENDING/RETRACTING
-        m = re.match(r"^!(.+)\.MOTOR\.STATUS=(.+);?$", line, re.IGNORECASE)
+        # !Z.G.N.MOTOR.STATUS=OPEN/CLOSE/STOP/HOME/EXTENDING/RETRACTING
+        m = re.match(r"^!(.+?)\.MOTOR\.STATUS=(.+)$", line, re.IGNORECASE)
         if m:
-            addr, val = m.group(1), m.group(2).upper()
-            state = self._state.setdefault(addr, {})
-            state["motor_status"] = val
+            addr, val = m.group(1), m.group(2).rstrip(";").upper()
+            self._state.setdefault(addr, {})["motor_status"] = val
+            changed = True
+
+        if changed:
             self.async_set_updated_data(dict(self._state))
-            return
+
+    # ------------------------------------------------------------------
+    # Staggered polling fallback
+    # ------------------------------------------------------------------
 
     async def _async_update_data(self) -> dict[str, Any]:
-        """Poll all devices for current state."""
+        """
+        Poll ONE device per coordinator update cycle (staggered polling).
+
+        This prevents the gateway from being overwhelmed.
+        DALI devices are skipped — they only support NOTIFY push.
+        """
         if not self.client.is_connected:
             raise UpdateFailed("e-Node not connected")
 
-        for dev in self.devices:
-            addr = dev["address"]
+        # Filter to pollable devices (skip DALI — it only supports NOTIFY)
+        pollable = [
+            d for d in self.devices
+            if d.get("bus_type", "I") != BUS_DALI
+        ]
+
+        if not pollable:
+            return dict(self._state)
+
+        # Rotate index — poll one device per cycle
+        self._poll_index = self._poll_index % len(pollable)
+        dev = pollable[self._poll_index]
+        self._poll_index += 1
+
+        addr = dev["address"]
+        try:
             if dev["platform"] == PLATFORM_LIGHT:
                 color_space = dev.get("color_space", "MONO")
                 if color_space == "HSV":
                     val = await self.client.async_query(addr, "LED", "COLOR")
                     if val:
-                        parts = val.split(".")
+                        parts = val.rstrip(";").split(".")
                         if len(parts) == 3:
                             state = self._state.setdefault(addr, {})
-                            state["h"] = int(parts[0])
-                            state["s"] = int(parts[1])
-                            state["v"] = int(parts[2])
-                            state["is_on"] = int(parts[2]) > 0
+                            state.update(
+                                h=int(parts[0]),
+                                s=int(parts[1]),
+                                v=int(parts[2]),
+                                is_on=int(parts[2]) > 0,
+                            )
                 else:
                     val = await self.client.async_query(addr, "LED", "VALUE")
                     if val:
-                        parts = val.split(".")
+                        parts = val.rstrip(";").split(".")
                         state = self._state.setdefault(addr, {})
-                        if len(parts) >= 1:
+                        try:
                             state["brightness_raw"] = int(parts[0])
                             state["is_on"] = int(parts[0]) > 0
+                        except (ValueError, IndexError):
+                            pass
 
             elif dev["platform"] == PLATFORM_COVER:
                 val = await self.client.async_query(addr, "MOTOR", "POSITION")
                 if val:
                     try:
-                        state = self._state.setdefault(addr, {})
-                        state["position"] = float(val)
+                        self._state.setdefault(addr, {})["position"] = float(val.rstrip(";"))
                     except ValueError:
                         pass
+
+        except Exception as exc:
+            _LOGGER.debug("Poll error for %s (%s): %s", dev.get("alias"), addr, exc)
 
         return dict(self._state)
