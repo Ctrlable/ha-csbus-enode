@@ -369,7 +369,7 @@ class ENodeCoordinator(DataUpdateCoordinator):
                 )
                 self.async_set_updated_data(dict(self._state))
                 return
-            # HSV,H.S.V — values may be integer or float
+            # HSV,H.S.V — values may be integer or float (3-part: full H/S/V)
             m = re.match(
                 r"^#(.+?)\.LED=HSV,(\d+(?:\.\d+)?)\.(\d+(?:\.\d+)?)\.(\d+(?:\.\d+)?)(?:\([^)]*\))?$",
                 line, re.IGNORECASE,
@@ -380,6 +380,20 @@ class ENodeCoordinator(DataUpdateCoordinator):
                 self._state.setdefault(addr, {}).update(
                     h=int(float(m.group(2))), s=int(float(m.group(3))), v=v, is_on=v > 0
                 )
+                self._mode_hints[addr] = "color"
+                self.async_set_updated_data(dict(self._state))
+                return
+            # HSV,H.V — 2-part format used by Lutron (hue + value, saturation implicit)
+            m = re.match(
+                r"^#(.+?)\.LED=HSV,(\d+(?:\.\d+)?)\.(\d+(?:\.\d+)?)(?:\([^)]*\))?$",
+                line, re.IGNORECASE,
+            )
+            if m:
+                addr = m.group(1)
+                h = int(float(m.group(2)))
+                v = int(float(m.group(3)))
+                existing_s = self._state.get(addr, {}).get("s", 240)
+                self._state.setdefault(addr, {}).update(h=h, s=existing_s, v=v, is_on=v > 0)
                 self._mode_hints[addr] = "color"
                 self.async_set_updated_data(dict(self._state))
                 return
@@ -494,20 +508,20 @@ class ENodeCoordinator(DataUpdateCoordinator):
         if not self.client.is_connected:
             raise UpdateFailed("e-Node not connected")
 
-        # Skip DMX and DALI — both crash or misbehave under individual polling.
-        # CS-Bus devices with NOTIFY don't need polling either, but it serves
-        # as a useful fallback for devices that missed a NOTIFY push.
+        # Only poll CS-Bus (I) devices — DMX/DALI crash or misbehave under
+        # individual polling, and any unknown bus type is also excluded since
+        # queries to unknown buses time out and may destabilise the gateway.
         pollable = [
             d for d in self.devices
-            if d.get("bus_type", "I") not in (BUS_DALI, BUS_DMX)
+            if d.get("bus_type", BUS_CSBUS) == BUS_CSBUS
         ]
         skipped = [
             d for d in self.devices
-            if d.get("bus_type", "I") in (BUS_DALI, BUS_DMX)
+            if d.get("bus_type", BUS_CSBUS) != BUS_CSBUS
         ]
         if skipped:
             _LOGGER.debug(
-                "Polling: skipping %d DMX/DALI device(s): %s",
+                "Polling: skipping %d non-CS-Bus device(s): %s",
                 len(skipped),
                 [f"{d['address']}(bus={d.get('bus_type','?')})" for d in skipped],
             )
