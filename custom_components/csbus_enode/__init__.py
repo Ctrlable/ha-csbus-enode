@@ -57,7 +57,7 @@ from .const import (
     PLATFORM_COVER,
     PLATFORM_LIGHT,
 )
-from .enode_client import ENodeClient, BUS_DALI, BUS_DMX
+from .enode_client import ENodeClient, BUS_CSBUS, BUS_DALI, BUS_DMX
 
 _LOGGER = logging.getLogger(__name__)
 
