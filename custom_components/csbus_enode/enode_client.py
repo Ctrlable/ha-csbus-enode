@@ -399,7 +399,12 @@ class ENodeClient:
         finally:
             remove()
 
-        result = [_normalise_device(d) for d in devices_raw.values() if d.get("uid")]
+        result = [
+            nd for d in devices_raw.values()
+            if d.get("uid")
+            for nd in [_normalise_device(d)]
+            if nd is not None
+        ]
         _LOGGER.info("e-Node DISCOVER: %d device(s) at %s", len(result), self.host)
         return result
 
@@ -464,7 +469,7 @@ class ENodeClient:
                 self._cmd_history.append((time.time(), self._cmd_seq, display))
                 self._writer.write(msg.encode("ascii", errors="ignore"))
                 await self._writer.drain()
-                _LOGGER.debug("e-Node TX [#%04d]: %s", self._cmd_seq, display)
+                _LOGGER.debug("e-Node %s TX [#%04d]: %s", self.host, self._cmd_seq, display)
                 return True
             except (OSError, ConnectionResetError) as exc:
                 _LOGGER.warning("e-Node send error: %s(%s)", type(exc).__name__, exc)
@@ -533,7 +538,7 @@ class ENodeClient:
                 buf += _strip_telnet_negotiation(chunk)
                 messages, buf = _split_messages(buf)
                 for msg in messages:
-                    _LOGGER.debug("e-Node RX: %s", msg)
+                    _LOGGER.debug("e-Node %s RX: %s", self.host, msg)
                     self._dispatch(msg)
             except asyncio.TimeoutError:
                 continue
@@ -642,6 +647,21 @@ def _normalise_device(raw: dict[str, Any]) -> dict[str, Any]:
     alias     = str(raw.get("alias", f"Device {uid}")).strip()
     address   = str(raw.get("address", "2.1.1")).strip().rstrip(".")
     type_name = str(raw.get("type", "")).strip()
+
+    # Validate ZGN address: must be Z.G.N with all-numeric parts and no octet > 99.
+    # Addresses like "172.16.1" are IP address fragments from misconfigured gateways.
+    _addr_parts = address.split(".")
+    if (
+        len(_addr_parts) != 3
+        or not all(p.isdigit() for p in _addr_parts)
+        or any(int(p) > 99 for p in _addr_parts)
+    ):
+        _LOGGER.warning(
+            "DISCOVER: UID%s has invalid ZGN address %r — "
+            "looks like an IP address fragment. Skipping device.",
+            uid, address,
+        )
+        return None
 
     form_str = raw.get("form", "")
     if form_str:

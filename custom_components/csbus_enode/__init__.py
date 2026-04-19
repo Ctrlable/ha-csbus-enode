@@ -104,6 +104,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         "e-Node %s: %d device(s) — %d light(s), %d cover(s)",
         host, len(devices), n_lights, n_covers,
     )
+    for d in devices:
+        _LOGGER.debug(
+            "  device: uid=%-8s bus=%-2s addr=%-10s platform=%-6s alias=%s",
+            d["uid"], d.get("bus_type", "?"), d["address"],
+            d["platform"], d.get("alias", ""),
+        )
 
     # Enable wildcard NOTIFY only for pure CS-Bus gateways.
     # A single wildcard command covers all devices on the bus.
@@ -466,6 +472,16 @@ class ENodeCoordinator(DataUpdateCoordinator):
             d for d in self.devices
             if d.get("bus_type", "I") not in (BUS_DALI, BUS_DMX)
         ]
+        skipped = [
+            d for d in self.devices
+            if d.get("bus_type", "I") in (BUS_DALI, BUS_DMX)
+        ]
+        if skipped:
+            _LOGGER.debug(
+                "Polling: skipping %d DMX/DALI device(s): %s",
+                len(skipped),
+                [f"{d['address']}(bus={d.get('bus_type','?')})" for d in skipped],
+            )
 
         if not pollable:
             return dict(self._state)
@@ -476,6 +492,10 @@ class ENodeCoordinator(DataUpdateCoordinator):
         self._poll_index += 1
 
         addr = dev["address"]
+        _LOGGER.debug(
+            "Polling device: addr=%s bus=%s alias=%s",
+            addr, dev.get("bus_type", "?"), dev.get("alias", ""),
+        )
         try:
             if dev["platform"] == PLATFORM_LIGHT:
                 color_space = dev.get("color_space", "MONO")
