@@ -160,9 +160,10 @@ class CSBusLight(CoordinatorEntity, LightEntity):
         self._color_space = device.get("color_space", "MONO")
         self._cct_support = device.get("cct_support", False)
 
-        # HA convention: min = coldest (high K), max = warmest (low K)
-        self._cct_cold_k  = device.get("cct_cool", 6500)   # e.g. 6500 K
-        self._cct_warm_k  = device.get("cct_warm", 2700)   # e.g. 2700 K
+        # cct_cool (6500 K) = coldest/bluest → HA max_color_temp_kelvin
+        # cct_warm (2700 K) = warmest/yellowest → HA min_color_temp_kelvin
+        self._cct_cold_k  = device.get("cct_cool", 6500)
+        self._cct_warm_k  = device.get("cct_warm", 2700)
 
         self._attr_unique_id   = f"csbus_{device['uid']}"
         self._attr_name        = device["alias"]
@@ -356,11 +357,13 @@ class CSBusLight(CoordinatorEntity, LightEntity):
 
     @property
     def min_color_temp_kelvin(self) -> int:
-        return self._cct_cold_k   # coldest = highest K = HA "min"
+        # HA min = lowest Kelvin number = warmest/most-yellow end of the slider (e.g. 2700 K)
+        return self._cct_warm_k
 
     @property
     def max_color_temp_kelvin(self) -> int:
-        return self._cct_warm_k   # warmest = lowest K = HA "max"
+        # HA max = highest Kelvin number = coolest/most-blue end of the slider (e.g. 6500 K)
+        return self._cct_cold_k
 
     # ------------------------------------------------------------------
     # Commands
