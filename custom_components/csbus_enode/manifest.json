@@ -1,7 +1,7 @@
 {
   "domain": "csbus_enode",
   "name": "Converging Systems e-Node (CS-Bus)",
-  "version": "2.0.0",
+  "version": "2.0.1",
   "documentation": "https://github.com/ctrlable/ha-csbus-enode",
   "issue_tracker": "https://github.com/ctrlable/ha-csbus-enode/issues",
   "codeowners": ["@ctrlable"],
