@@ -39,7 +39,6 @@ from typing import Any
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant
-from homeassistant.helpers.event import async_track_time_interval
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
 from .const import (
@@ -171,20 +170,43 @@ def _parse_devices(raw: list[dict[str, Any]]) -> list[dict[str, Any]]:
         device_class = d.get("device_class", "LIGHT")
 
         if platform == PLATFORM_LIGHT:
-            devices.append({
-                "uid":         d["uid"],
-                "alias":       d.get("alias", f"Light {d['uid']}"),
-                "address":     d.get("address", "2.1.1"),
-                "platform":    PLATFORM_LIGHT,
-                "device_class": device_class,
-                "color_space": d.get("color_space", "MONO"),
-                "cct_support": d.get("cct_support", False),
-                "cct_warm":    d.get("cct_warm", 2700),
-                "cct_cool":    d.get("cct_cool", 6500),
-                "channels":    d.get("channels", 1),
-                "bus_type":    d.get("bus_type", "I"),
-                "type_name":   d.get("type_name", "ILC"),
-            })
+            channel_addresses = d.get("channel_addresses", {})
+            channel_aliases   = d.get("channel_aliases", {})
+
+            if channel_addresses:
+                # ILC-DALI multi-channel or similar: one light entity per channel
+                # Mirrors the IMC-300 motor pattern — same !UID.X.BUS.ADDRESS protocol
+                for ch, addr in channel_addresses.items():
+                    devices.append({
+                        "uid":          f"{d['uid']}_{ch}",
+                        "alias":        channel_aliases.get(ch, f"{d.get('alias', 'Light')} Ch {ch}"),
+                        "address":      addr,
+                        "platform":     PLATFORM_LIGHT,
+                        "device_class": device_class,
+                        "color_space":  d.get("color_space", "MONO"),
+                        "cct_support":  d.get("cct_support", False),
+                        "cct_warm":     d.get("cct_warm", 2700),
+                        "cct_cool":     d.get("cct_cool", 6500),
+                        "channels":     1,
+                        "bus_type":     d.get("bus_type", "I"),
+                        "type_name":    d.get("type_name", "ILC"),
+                        "parent_uid":   d["uid"],
+                    })
+            else:
+                devices.append({
+                    "uid":          d["uid"],
+                    "alias":        d.get("alias", f"Light {d['uid']}"),
+                    "address":      d.get("address", "2.1.1"),
+                    "platform":     PLATFORM_LIGHT,
+                    "device_class": device_class,
+                    "color_space":  d.get("color_space", "MONO"),
+                    "cct_support":  d.get("cct_support", False),
+                    "cct_warm":     d.get("cct_warm", 2700),
+                    "cct_cool":     d.get("cct_cool", 6500),
+                    "channels":     d.get("channels", 1),
+                    "bus_type":     d.get("bus_type", "I"),
+                    "type_name":    d.get("type_name", "ILC"),
+                })
 
         elif platform == PLATFORM_COVER:
             channel_addresses = d.get("channel_addresses", {})
@@ -300,6 +322,9 @@ class ENodeCoordinator(DataUpdateCoordinator):
                                  b=int(parts[2]), w=int(parts[3]))
                 elif len(parts) == 3:
                     state.update(r=int(parts[0]), g=int(parts[1]), b=int(parts[2]))
+                elif len(parts) == 2:
+                    # Bi-white (ILC-200E / DALI-TW): VALUE=warm_channel.cool_channel
+                    state.update(warm=int(parts[0]), cool=int(parts[1]))
                 elif len(parts) == 1:
                     state["brightness_raw"] = int(parts[0])
                 state["is_on"] = any(int(p) > 0 for p in parts)

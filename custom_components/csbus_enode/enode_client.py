@@ -295,10 +295,12 @@ class ENodeClient:
                 devices_raw.setdefault(m.group(1), {"uid": m.group(1)})["form"] = m.group(2).strip()
                 return
 
-            # !UID101.ALIAS=Main Cove RGBV
-            m = re.match(r"^!UID(\w+)\.ALIAS=(.+)$", line, re.IGNORECASE)
+            # !UID101.ALIAS=Main Cove RGBV  (value may be empty)
+            m = re.match(r"^!UID(\w+)\.ALIAS=(.*)$", line, re.IGNORECASE)
             if m:
-                devices_raw.setdefault(m.group(1), {"uid": m.group(1)})["alias"] = m.group(2).strip()
+                val = m.group(2).strip()
+                if val:
+                    devices_raw.setdefault(m.group(1), {"uid": m.group(1)})["alias"] = val
                 return
 
             # !UID101.BUS.ADDRESS=2.1.1
@@ -386,41 +388,50 @@ class ENodeClient:
                 return False
 
     async def _authenticate(self) -> None:
-        """Handle Telnet login prompt if auth is enabled on the e-Node."""
+        """
+        Handle Telnet login following the DDK auth sequence:
+          ← User:\r\n
+          → username\r\n
+          ← Password:\r\n
+          → password\r\n
+          ← Connected:\r\n   (must arrive before any commands are sent)
+        """
         assert self._reader and self._writer
-        buf = b""
-        deadline = asyncio.get_event_loop().time() + 6.0
 
-        while asyncio.get_event_loop().time() < deadline:
-            try:
-                chunk = await asyncio.wait_for(self._reader.read(512), timeout=1.5)
-            except asyncio.TimeoutError:
-                break
-            if not chunk:
-                break
-            buf += _strip_telnet_negotiation(chunk)
-            text = buf.decode("ascii", errors="ignore").lower()
-            if "user" in text or "connected" in text:
-                break
+        async def _read_until(keywords: list[str], timeout: float) -> str:
+            """Read data until any keyword appears or timeout expires."""
+            buf = b""
+            deadline = asyncio.get_event_loop().time() + timeout
+            while asyncio.get_event_loop().time() < deadline:
+                try:
+                    chunk = await asyncio.wait_for(self._reader.read(512), timeout=1.5)
+                except asyncio.TimeoutError:
+                    break
+                if not chunk:
+                    break
+                buf += _strip_telnet_negotiation(chunk)
+                text = buf.decode("ascii", errors="ignore").lower()
+                if any(kw in text for kw in keywords):
+                    break
+            return buf.decode("ascii", errors="ignore")
 
-        text_orig = buf.decode("ascii", errors="ignore")
-        _LOGGER.debug("e-Node banner: %r", text_orig[:200])
+        banner = await _read_until(["user:", "connected:"], timeout=6.0)
+        _LOGGER.debug("e-Node banner: %r", banner[:200])
 
-        if "user" in text_orig.lower():
+        m = re.search(r'\b(20\d{2})\b', banner)
+        if m:
+            self._firmware_year = m.group(1)
+
+        if "user:" in banner.lower():
             _LOGGER.debug("e-Node requesting credentials")
             self._writer.write(f"{self.username}\r\n".encode())
             await self._writer.drain()
-            await asyncio.sleep(0.6)
+            # Wait for "Password:" before sending password
+            await _read_until(["password:"], timeout=4.0)
             self._writer.write(f"{self.password}\r\n".encode())
             await self._writer.drain()
-            try:
-                await asyncio.wait_for(self._reader.readline(), timeout=4.0)
-            except asyncio.TimeoutError:
-                pass
-
-        m = re.search(r'\b(20\d{2})\b', text_orig)
-        if m:
-            self._firmware_year = m.group(1)
+            # Wait for "Connected:" before allowing commands
+            await _read_until(["connected:"], timeout=4.0)
 
     async def _receive_loop(self) -> None:
         """Read from the socket, split into messages, dispatch to listeners."""
@@ -547,10 +558,16 @@ def _normalise_device(raw: dict[str, Any]) -> dict[str, Any]:
     if form_str:
         form = _parse_form(form_str)
     else:
+        # No FORM — infer from type name so DALI/DMX devices aren't misclassified
         is_motor = any(x in type_name.upper() for x in ("IMC", "MOTOR", "BRIC"))
+        bus_type = (
+            BUS_DALI  if "DALI" in type_name.upper() else
+            BUS_DMX   if "DMX"  in type_name.upper() else
+            BUS_CSBUS
+        )
         form = {
             "channels":     0,
-            "bus_type":     BUS_CSBUS,
+            "bus_type":     bus_type,
             "device_class": "MOTOR" if is_motor else "LIGHT",
             "color_space":  "MONO"  if is_motor else "HSV",
             "cct_support":  False,
@@ -573,7 +590,10 @@ def _normalise_device(raw: dict[str, Any]) -> dict[str, Any]:
         "type_name":    type_name or f"e-Node/{form['bus_type']}",
     }
 
-    if form["device_class"] == "MOTOR" and raw.get("channel_addresses"):
+    # Preserve per-channel address map for any multi-channel device:
+    # IMC-300 motors (A/B/C/D channels) and ILC-DALI multi-channel lights both
+    # use the same !UID.X.BUS.ADDRESS pattern — expand whichever has channels.
+    if raw.get("channel_addresses"):
         desc["channel_addresses"] = raw["channel_addresses"]
         desc["channel_aliases"]   = raw.get("channel_aliases", {})
 
