@@ -311,9 +311,24 @@ class ENodeCoordinator(DataUpdateCoordinator):
         self._state: dict[str, dict[str, Any]] = {}
         # Index for staggered polling — rotate through devices one per cycle
         self._poll_index = 0
+        # One-shot mode hints written by command echoes (CCT, HSV).
+        # Consumed by entity._handle_coordinator_update so that _last_mode
+        # is updated only by explicit command echoes — never by poll results.
+        self._mode_hints: dict[str, str] = {}
 
     def get_state(self, address: str) -> dict[str, Any]:
         return self._state.get(address, {})
+
+    def consume_mode_hint(self, address: str) -> str | None:
+        """
+        Return and clear the pending mode hint for an address.
+
+        Hints are set only by command echoes (CCT → "cct", HSV/RGB → "color").
+        Polls never set hints, so calling this from _handle_coordinator_update
+        is safe: hints only flip _last_mode when a real command echo caused it.
+        Returns None if no hint is pending.
+        """
+        return self._mode_hints.pop(address, None)
 
     # ------------------------------------------------------------------
     # NOTIFY handler — called for every inbound Telnet message
@@ -360,18 +375,20 @@ class ENodeCoordinator(DataUpdateCoordinator):
                 line, re.IGNORECASE,
             )
             if m:
+                addr = m.group(1)
                 v = int(m.group(4))
-                self._state.setdefault(m.group(1), {}).update(
+                self._state.setdefault(addr, {}).update(
                     h=int(m.group(2)), s=int(m.group(3)), v=v, is_on=v > 0
                 )
+                self._mode_hints[addr] = "color"
                 self.async_set_updated_data(dict(self._state))
                 return
             # CCT,XXXX (Kelvin)
             m = re.match(r"^#(.+?)\.LED=CCT,(\d+)(?:\([^)]*\))?$", line, re.IGNORECASE)
             if m:
-                self._state.setdefault(m.group(1), {}).update(
-                    cct=int(m.group(2)), is_on=True
-                )
+                addr = m.group(1)
+                self._state.setdefault(addr, {}).update(cct=int(m.group(2)), is_on=True)
+                self._mode_hints[addr] = "cct"
                 self.async_set_updated_data(dict(self._state))
                 return
             return  # ignore all other # echoes
