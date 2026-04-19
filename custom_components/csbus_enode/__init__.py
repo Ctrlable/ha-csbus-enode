@@ -369,28 +369,40 @@ class ENodeCoordinator(DataUpdateCoordinator):
                 )
                 self.async_set_updated_data(dict(self._state))
                 return
-            # HSV,H.S.V
+            # HSV,H.S.V — values may be integer or float
             m = re.match(
-                r"^#(.+?)\.LED=HSV,(\d+)\.(\d+)\.(\d+)(?:\([^)]*\))?$",
+                r"^#(.+?)\.LED=HSV,(\d+(?:\.\d+)?)\.(\d+(?:\.\d+)?)\.(\d+(?:\.\d+)?)(?:\([^)]*\))?$",
                 line, re.IGNORECASE,
             )
             if m:
                 addr = m.group(1)
-                v = int(m.group(4))
+                v = int(float(m.group(4)))
                 self._state.setdefault(addr, {}).update(
-                    h=int(m.group(2)), s=int(m.group(3)), v=v, is_on=v > 0
+                    h=int(float(m.group(2))), s=int(float(m.group(3))), v=v, is_on=v > 0
                 )
                 self._mode_hints[addr] = "color"
                 self.async_set_updated_data(dict(self._state))
                 return
-            # CCT,XXXX (Kelvin)
-            m = re.match(r"^#(.+?)\.LED=CCT,(\d+)(?:\([^)]*\))?$", line, re.IGNORECASE)
+            # CCT,XXXX (Kelvin) — value may be integer or float (e.g. CCT,5000.0)
+            m = re.match(r"^#(.+?)\.LED=CCT,(\d+(?:\.\d+)?)(?:\([^)]*\))?$", line, re.IGNORECASE)
             if m:
                 addr = m.group(1)
-                self._state.setdefault(addr, {}).update(cct=int(m.group(2)), is_on=True)
+                self._state.setdefault(addr, {}).update(cct=int(float(m.group(2))), is_on=True)
                 self._mode_hints[addr] = "cct"
                 self.async_set_updated_data(dict(self._state))
                 return
+            # RECALL,N — scene recalled; actual color/CCT unknown without a query.
+            # Schedule an async fetch so HA reflects the recalled state.
+            m = re.match(r"^#(.+?)\.LED=RECALL,(\d+)(?:\([^)]*\))?$", line, re.IGNORECASE)
+            if m:
+                addr = m.group(1)
+                self._state.setdefault(addr, {})["is_on"] = True
+                dev = next((d for d in self.devices if d["address"] == addr), None)
+                if dev and dev.get("bus_type", BUS_CSBUS) not in (BUS_DALI, BUS_DMX):
+                    asyncio.ensure_future(self._async_fetch_state_after_recall(addr, dev))
+                self.async_set_updated_data(dict(self._state))
+                return
+            _LOGGER.debug("Unhandled # echo: %s", line)
             return  # ignore all other # echoes
 
         if not line.startswith("!"):
@@ -551,3 +563,49 @@ class ENodeCoordinator(DataUpdateCoordinator):
             _LOGGER.debug("Poll error for %s (%s): %s", dev.get("alias"), addr, exc)
 
         return dict(self._state)
+
+    async def _async_fetch_state_after_recall(
+        self, addr: str, dev: dict[str, Any]
+    ) -> None:
+        """Query a device's actual state after a RECALL echo.
+
+        RECALL commands invoke a stored preset — the echo doesn't carry color/CCT
+        data. We query both LED.VALUE (brightness) and either LED.COLOR (HSV) or
+        LED.STATUS (CCT) depending on the device's color space, then push the
+        result to the coordinator so HA reflects the recalled state.
+        """
+        await asyncio.sleep(0.3)  # let the preset settle before querying
+        try:
+            state = self._state.setdefault(addr, {})
+            color_space = dev.get("color_space", "MONO")
+
+            if color_space == "HSV":
+                val = await self.client.async_query(addr, "LED", "COLOR")
+                if val:
+                    parts = val.rstrip(";").split(".")
+                    if len(parts) == 3:
+                        h, s, v = int(parts[0]), int(parts[1]), int(parts[2])
+                        state.update(h=h, s=s, v=v, is_on=v > 0)
+                        self._mode_hints[addr] = "color"
+                        self.async_set_updated_data(dict(self._state))
+                        return
+
+            if dev.get("cct_support"):
+                val = await self.client.async_query(addr, "LED", "STATUS")
+                if val:
+                    parts = val.rstrip(";").split(",")
+                    if len(parts) >= 2:
+                        state.update(sun=int(parts[0]), cct=int(parts[1]))
+                        self._mode_hints[addr] = "cct"
+                        self.async_set_updated_data(dict(self._state))
+                        return
+
+            # Fallback: query raw brightness value
+            val = await self.client.async_query(addr, "LED", "VALUE")
+            if val:
+                raw = int(val.rstrip(";").split(".")[0])
+                state.update(brightness_raw=raw, is_on=raw > 0)
+                self.async_set_updated_data(dict(self._state))
+
+        except Exception as exc:
+            _LOGGER.debug("Recall state fetch error for %s: %s", addr, exc)
