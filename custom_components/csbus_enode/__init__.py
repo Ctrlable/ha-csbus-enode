@@ -102,6 +102,20 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         host, len(devices), n_lights, n_covers,
     )
 
+    # Enable NOTIFY push for CS-Bus devices only (per-device, never wildcard).
+    # DMX is excluded — wildcard NOTIFY causes firmware crash.
+    # DALI is excluded — not supported by ILC-DALI firmware.
+    cs_lights = [d["address"] for d in devices
+                 if d.get("bus_type") == BUS_CSBUS and d["platform"] == PLATFORM_LIGHT]
+    cs_motors = [d["address"] for d in devices
+                 if d.get("bus_type") == BUS_CSBUS and d["platform"] == PLATFORM_COVER]
+    if cs_lights or cs_motors:
+        await client.async_enable_notify_for_devices(cs_lights, cs_motors)
+        _LOGGER.debug(
+            "e-Node %s: NOTIFY enabled for %d CS-Bus light(s), %d motor(s)",
+            host, len(cs_lights), len(cs_motors),
+        )
+
     # Clamp scan_interval based on the bus types present
     bus_types = {d.get("bus_type", "I") for d in devices}
     if BUS_DMX in bus_types:
@@ -305,6 +319,24 @@ class ENodeCoordinator(DataUpdateCoordinator):
         '#' echoes and '*' errors are ignored.
         """
         line = line.strip().rstrip(";")
+
+        # Command echoes — the e-Node echoes every accepted command back with a '#'
+        # prefix, regardless of the source (web UI, keypad, Telnet, CS-Bus event).
+        # Parse ON/OFF echoes so external state changes are reflected in HA.
+        # The optional (SOURCE) suffix e.g. (TELNET), (WEB), (CSBUS) is ignored.
+        if line.startswith("#"):
+            m = re.match(r"^#(.+?)\.LED=ON(?:\([^)]*\))?$", line, re.IGNORECASE)
+            if m:
+                self._state.setdefault(m.group(1), {})["is_on"] = True
+                self.async_set_updated_data(dict(self._state))
+                return
+            m = re.match(r"^#(.+?)\.LED=OFF(?:\([^)]*\))?$", line, re.IGNORECASE)
+            if m:
+                self._state.setdefault(m.group(1), {})["is_on"] = False
+                self.async_set_updated_data(dict(self._state))
+                return
+            return  # ignore all other # echoes
+
         if not line.startswith("!"):
             return
 
