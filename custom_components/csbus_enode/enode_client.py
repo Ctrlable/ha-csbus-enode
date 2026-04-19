@@ -45,6 +45,7 @@ from __future__ import annotations
 import asyncio
 import collections
 import logging
+import os
 import re
 import time
 from typing import Any, Callable
@@ -129,11 +130,15 @@ class ENodeClient:
         port: int = TELNET_PORT,
         username: str = "Telnet 1",
         password: str = "Password 1",
+        crash_log_dir: str | None = None,
     ) -> None:
         self.host     = host
         self.port     = port
         self.username = username
         self.password = password
+        # Directory where crash dump files are written (survives HA restarts).
+        # Set to hass.config.config_dir by async_setup_entry.
+        self._crash_log_dir = crash_log_dir
 
         self._reader: asyncio.StreamReader | None = None
         self._writer: asyncio.StreamWriter | None = None
@@ -216,7 +221,10 @@ class ENodeClient:
             )
             return True
         except (OSError, asyncio.TimeoutError) as exc:
-            _LOGGER.error("e-Node connection failed (%s): %s", self.host, exc)
+            _LOGGER.error(
+                "e-Node connection failed (%s): %s(%s)",
+                self.host, type(exc).__name__, exc or "no detail",
+            )
             self._connected = False
             return False
 
@@ -408,14 +416,42 @@ class ENodeClient:
     # ------------------------------------------------------------------
 
     def _log_cmd_history(self, trigger: str) -> None:
-        """Dump the outbound command history to the log at WARNING level."""
-        _LOGGER.warning(
-            "e-Node %s: connection lost after %d total command(s) (trigger: %s). "
-            "Last %d command(s):",
-            self.host, self._cmd_seq, trigger, len(self._cmd_history),
+        """
+        Dump the outbound command history to the HA log AND a persistent file.
+
+        The file survives HA restarts so we can diagnose crashes that happened
+        in a prior session. Each crash appends to:
+            <config_dir>/csbus_enode_crash_<host>.log
+        """
+        header = (
+            f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] "
+            f"e-Node {self.host}: connection lost after {self._cmd_seq} "
+            f"total command(s). Trigger: {trigger}. "
+            f"Last {len(self._cmd_history)} command(s):\n"
         )
-        for ts, seq, cmd in self._cmd_history:
-            _LOGGER.warning("  [#%04d %s] %s", seq, time.strftime("%H:%M:%S", time.localtime(ts)), cmd)
+        lines = [
+            f"  [#{seq:04d} {time.strftime('%H:%M:%S', time.localtime(ts))}] {cmd}\n"
+            for ts, seq, cmd in self._cmd_history
+        ]
+        separator = "-" * 72 + "\n"
+
+        # Always write to HA log
+        _LOGGER.warning(header.rstrip())
+        for line in lines:
+            _LOGGER.warning(line.rstrip())
+
+        # Write / append to persistent crash log file
+        if self._crash_log_dir:
+            safe_host = self.host.replace(".", "_").replace(":", "_")
+            path = os.path.join(self._crash_log_dir, f"csbus_enode_crash_{safe_host}.log")
+            try:
+                with open(path, "a", encoding="utf-8") as f:
+                    f.write(separator)
+                    f.write(header)
+                    f.writelines(lines)
+                _LOGGER.warning("e-Node crash dump written to %s", path)
+            except OSError as exc:
+                _LOGGER.warning("Could not write crash dump to %s: %s", path, exc)
 
     async def _send_raw(self, msg: str) -> bool:
         async with self._lock:
@@ -423,15 +459,16 @@ class ENodeClient:
                 _LOGGER.warning("e-Node not connected — dropped: %s", msg.strip())
                 return False
             try:
+                display = msg.strip() or "[keepalive]"
                 self._cmd_seq += 1
-                self._cmd_history.append((time.time(), self._cmd_seq, msg.strip()))
+                self._cmd_history.append((time.time(), self._cmd_seq, display))
                 self._writer.write(msg.encode("ascii", errors="ignore"))
                 await self._writer.drain()
-                _LOGGER.debug("e-Node TX [#%04d]: %s", self._cmd_seq, msg.strip())
+                _LOGGER.debug("e-Node TX [#%04d]: %s", self._cmd_seq, display)
                 return True
             except (OSError, ConnectionResetError) as exc:
-                _LOGGER.warning("e-Node send error: %s", exc)
-                self._log_cmd_history(f"send error: {exc}")
+                _LOGGER.warning("e-Node send error: %s(%s)", type(exc).__name__, exc)
+                self._log_cmd_history(f"send error: {type(exc).__name__}({exc})")
                 self._connected = False
                 asyncio.create_task(self._reconnect())
                 return False
@@ -501,8 +538,8 @@ class ENodeClient:
             except asyncio.TimeoutError:
                 continue
             except (OSError, ConnectionResetError) as exc:
-                _LOGGER.warning("e-Node receive error: %s", exc)
-                self._log_cmd_history(f"receive error: {exc}")
+                _LOGGER.warning("e-Node receive error: %s(%s)", type(exc).__name__, exc)
+                self._log_cmd_history(f"receive error: {type(exc).__name__}({exc})")
                 break
 
         self._connected = False

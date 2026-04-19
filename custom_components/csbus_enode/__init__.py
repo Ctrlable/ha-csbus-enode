@@ -82,7 +82,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     password = entry.data.get(CONF_PASSWORD, DEFAULT_PASSWORD)
     scan_interval = entry.options.get(CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL)
 
-    client = ENodeClient(host=host, port=port, username=username, password=password)
+    client = ENodeClient(
+        host=host, port=port, username=username, password=password,
+        crash_log_dir=hass.config.config_dir,
+    )
 
     if not await client.async_connect():
         _LOGGER.error("Failed to connect to e-Node at %s", host)
