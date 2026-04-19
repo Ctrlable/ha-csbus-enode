@@ -183,6 +183,53 @@ class CSBusLight(CoordinatorEntity, LightEntity):
         # without depending on NOTIFY feedback
         self._last_mode: str = _MODE_CCT if self._cct_support and self._color_space != "HSV" else _MODE_DIM
 
+        # Previous coordinator state snapshot — used in _handle_coordinator_update
+        # to detect which kind of state change arrived (CCT / color / brightness).
+        self._prev_coord_state: dict[str, Any] = {}
+
+    # ------------------------------------------------------------------
+    # Coordinator update hook
+    # ------------------------------------------------------------------
+
+    def _handle_coordinator_update(self) -> None:
+        """
+        Called whenever the coordinator fires a new state update.
+
+        Two jobs:
+        1. Update _last_mode when an EXTERNAL command (keypad, Lutron, web UI)
+           changed the fixture into CCT or color mode.  Without this, HA keeps
+           showing the wrong color_mode after external commands.
+
+        2. Evict opt_state keys that are now confirmed by real device state.
+           opt_state was written optimistically after OUR last command; once the
+           coordinator receives the echo (or a poll result) for the same key,
+           the real value should take over so external changes show through.
+           Exception: None sentinels in opt_state mean "actively suppress this
+           coordinator key" (e.g. h/s cleared after a CCT command) — keep those.
+        """
+        coord = self.coordinator.get_state(self._address)
+        prev  = self._prev_coord_state
+
+        # --- 1. Update _last_mode from coordinator state delta ---
+        cct_arrived = coord.get("cct") is not None and coord.get("cct") != prev.get("cct")
+        color_arrived = (
+            coord.get("h") is not None
+            and (coord.get("h") != prev.get("h") or coord.get("s") != prev.get("s"))
+        )
+        if cct_arrived:
+            self._last_mode = _MODE_CCT
+        elif color_arrived:
+            self._last_mode = _MODE_COLOR
+
+        self._prev_coord_state = dict(coord)
+
+        # --- 2. Evict stale opt_state overrides ---
+        for key in list(self._opt_state):
+            if self._opt_state[key] is not None and coord.get(key) is not None:
+                del self._opt_state[key]
+
+        super()._handle_coordinator_update()
+
     # ------------------------------------------------------------------
     # Device info
     # ------------------------------------------------------------------
