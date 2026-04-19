@@ -43,8 +43,10 @@ DISCOVER PROTOCOL
 from __future__ import annotations
 
 import asyncio
+import collections
 import logging
 import re
+import time
 from typing import Any, Callable
 
 _LOGGER = logging.getLogger(__name__)
@@ -62,6 +64,9 @@ RECONNECT_DELAY  = 10.0
 BUS_CSBUS = "I"
 BUS_DMX   = "X"
 BUS_DALI  = "D"
+
+# How many outbound commands to keep in the crash-diagnosis ring buffer
+CMD_HISTORY_SIZE = 50
 
 # Telnet IAC negotiation bytes
 _IAC = 0xFF
@@ -142,6 +147,14 @@ class ENodeClient:
         # Set True for CS-Bus gateways only; wildcard NOTIFY is re-sent on reconnect.
         # NEVER set for DMX (causes 44 Hz flood crash) or DALI (not supported).
         self._notify_enabled: bool = False
+        # Ring buffer of the last CMD_HISTORY_SIZE outbound commands.
+        # Each entry: (wall_time_float, sequence_int, raw_command_str).
+        # Dumped to log at WARNING level whenever the connection drops so we can
+        # pinpoint exactly which command (or command count) caused the crash.
+        self._cmd_seq: int = 0
+        self._cmd_history: collections.deque = collections.deque(
+            maxlen=CMD_HISTORY_SIZE
+        )
 
     # ------------------------------------------------------------------
     # Public API
@@ -394,18 +407,31 @@ class ENodeClient:
     # Internal helpers
     # ------------------------------------------------------------------
 
+    def _log_cmd_history(self, trigger: str) -> None:
+        """Dump the outbound command history to the log at WARNING level."""
+        _LOGGER.warning(
+            "e-Node %s: connection lost after %d total command(s) (trigger: %s). "
+            "Last %d command(s):",
+            self.host, self._cmd_seq, trigger, len(self._cmd_history),
+        )
+        for ts, seq, cmd in self._cmd_history:
+            _LOGGER.warning("  [#%04d %s] %s", seq, time.strftime("%H:%M:%S", time.localtime(ts)), cmd)
+
     async def _send_raw(self, msg: str) -> bool:
         async with self._lock:
             if not self._writer or self._writer.is_closing():
                 _LOGGER.warning("e-Node not connected — dropped: %s", msg.strip())
                 return False
             try:
+                self._cmd_seq += 1
+                self._cmd_history.append((time.time(), self._cmd_seq, msg.strip()))
                 self._writer.write(msg.encode("ascii", errors="ignore"))
                 await self._writer.drain()
-                _LOGGER.debug("e-Node TX: %s", msg.strip())
+                _LOGGER.debug("e-Node TX [#%04d]: %s", self._cmd_seq, msg.strip())
                 return True
             except (OSError, ConnectionResetError) as exc:
                 _LOGGER.warning("e-Node send error: %s", exc)
+                self._log_cmd_history(f"send error: {exc}")
                 self._connected = False
                 asyncio.create_task(self._reconnect())
                 return False
@@ -476,9 +502,12 @@ class ENodeClient:
                 continue
             except (OSError, ConnectionResetError) as exc:
                 _LOGGER.warning("e-Node receive error: %s", exc)
+                self._log_cmd_history(f"receive error: {exc}")
                 break
 
         self._connected = False
+        if not self._reconnecting:
+            self._log_cmd_history("remote closed connection")
         asyncio.create_task(self._reconnect())
 
     def _dispatch(self, line: str) -> None:
