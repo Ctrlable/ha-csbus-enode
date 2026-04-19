@@ -139,10 +139,9 @@ class ENodeClient:
         self._keepalive_task: asyncio.Task | None = None
         self._lock = asyncio.Lock()
         self._firmware_year: str = ""
-        # Per-device NOTIFY addresses — populated by async_enable_notify_for_devices()
-        # Re-sent automatically on reconnect. DMX and DALI are never included.
-        self._notify_light_addrs: list[str] = []
-        self._notify_motor_addrs: list[str] = []
+        # Set True for CS-Bus gateways only; wildcard NOTIFY is re-sent on reconnect.
+        # NEVER set for DMX (causes 44 Hz flood crash) or DALI (not supported).
+        self._notify_enabled: bool = False
 
     # ------------------------------------------------------------------
     # Public API
@@ -158,31 +157,21 @@ class ENodeClient:
                 pass
         return _remove
 
-    async def async_enable_notify_for_devices(
-        self,
-        light_addrs: list[str],
-        motor_addrs: list[str],
-    ) -> None:
+    async def async_enable_notify(self) -> None:
         """
-        Enable NOTIFY push for specific CS-Bus device addresses.
+        Enable wildcard NOTIFY push for a CS-Bus gateway.
 
-        Call once after discovery with the ZGN addresses of CS-Bus lights and
-        motors. The addresses are stored and re-sent automatically on reconnect.
+        Sends two wildcard commands that instruct the e-Node to push state
+        changes for ALL connected CS-Bus lights and motors automatically.
+        The flag is stored and the commands are re-sent on every reconnect.
 
-        NEVER pass DMX or DALI addresses here:
-          - DMX: NOTIFY causes a 44 Hz message flood that crashes the firmware.
-          - DALI: NOTIFY is not supported by the ILC-DALI firmware.
+        Call ONLY for pure CS-Bus gateways — NEVER for DMX or DALI:
+          - DMX: NOTIFY causes a 44 Hz flood that crashes the firmware.
+          - DALI: NOTIFY is not supported by ILC-DALI firmware.
         """
-        self._notify_light_addrs = list(light_addrs)
-        self._notify_motor_addrs = list(motor_addrs)
-        await self._send_notify_commands()
-
-    async def _send_notify_commands(self) -> None:
-        """Send per-device NOTIFY enable commands for stored CS-Bus addresses."""
-        for addr in self._notify_light_addrs:
-            await self._send_raw(f"#{addr}.LED.NOTIFY=VALUE;\r\n")
-        for addr in self._notify_motor_addrs:
-            await self._send_raw(f"#{addr}.MOTOR.NOTIFY=ON;\r\n")
+        self._notify_enabled = True
+        await self._send_raw("#0.0.0.LED.NOTIFY=VALUE;\r\n")
+        await self._send_raw("#0.0.0.MOTOR.NOTIFY=ON;\r\n")
 
     async def async_connect(self) -> bool:
         """Open Telnet connection and authenticate. Returns True on success."""
@@ -204,9 +193,10 @@ class ENodeClient:
             self._keepalive_task = asyncio.create_task(
                 self._keepalive_loop(), name=f"enode_keepalive_{self.host}"
             )
-            # Re-send NOTIFY enables for CS-Bus devices on every connect/reconnect
-            if self._notify_light_addrs or self._notify_motor_addrs:
-                await self._send_notify_commands()
+            # Re-send wildcard NOTIFY for CS-Bus gateways on every connect/reconnect
+            if self._notify_enabled:
+                await self._send_raw("#0.0.0.LED.NOTIFY=VALUE;\r\n")
+                await self._send_raw("#0.0.0.MOTOR.NOTIFY=ON;\r\n")
             _LOGGER.info(
                 "e-Node connected at %s (firmware: %s)",
                 self.host, self._firmware_year or "unknown",

@@ -102,22 +102,21 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         host, len(devices), n_lights, n_covers,
     )
 
-    # Enable NOTIFY push for CS-Bus devices only (per-device, never wildcard).
-    # DMX is excluded — wildcard NOTIFY causes firmware crash.
-    # DALI is excluded — not supported by ILC-DALI firmware.
-    cs_lights = [d["address"] for d in devices
-                 if d.get("bus_type") == BUS_CSBUS and d["platform"] == PLATFORM_LIGHT]
-    cs_motors = [d["address"] for d in devices
-                 if d.get("bus_type") == BUS_CSBUS and d["platform"] == PLATFORM_COVER]
-    if cs_lights or cs_motors:
-        await client.async_enable_notify_for_devices(cs_lights, cs_motors)
+    # Enable wildcard NOTIFY only for pure CS-Bus gateways.
+    # A single wildcard command covers all devices on the bus.
+    # DMX is excluded — NOTIFY causes a 44 Hz flood that crashes the firmware.
+    # DALI is excluded — NOTIFY is not supported by ILC-DALI firmware.
+    bus_types = {d.get("bus_type", "I") for d in devices}
+    if bus_types == {BUS_CSBUS}:
+        await client.async_enable_notify()
+        _LOGGER.debug("e-Node %s: wildcard NOTIFY enabled (CS-Bus gateway)", host)
+    else:
         _LOGGER.debug(
-            "e-Node %s: NOTIFY enabled for %d CS-Bus light(s), %d motor(s)",
-            host, len(cs_lights), len(cs_motors),
+            "e-Node %s: NOTIFY skipped — bus types present: %s",
+            host, bus_types,
         )
 
     # Clamp scan_interval based on the bus types present
-    bus_types = {d.get("bus_type", "I") for d in devices}
     if BUS_DMX in bus_types:
         scan_interval = max(scan_interval, MIN_SCAN_INTERVAL_DMX)
     if BUS_DALI in bus_types:
@@ -325,14 +324,45 @@ class ENodeCoordinator(DataUpdateCoordinator):
         # Parse ON/OFF echoes so external state changes are reflected in HA.
         # The optional (SOURCE) suffix e.g. (TELNET), (WEB), (CSBUS) is ignored.
         if line.startswith("#"):
+            # ON
             m = re.match(r"^#(.+?)\.LED=ON(?:\([^)]*\))?$", line, re.IGNORECASE)
             if m:
                 self._state.setdefault(m.group(1), {})["is_on"] = True
                 self.async_set_updated_data(dict(self._state))
                 return
+            # OFF
             m = re.match(r"^#(.+?)\.LED=OFF(?:\([^)]*\))?$", line, re.IGNORECASE)
             if m:
                 self._state.setdefault(m.group(1), {})["is_on"] = False
+                self.async_set_updated_data(dict(self._state))
+                return
+            # SET,N — dim level (0–240)
+            m = re.match(r"^#(.+?)\.LED=SET,(\d+)(?:\([^)]*\))?$", line, re.IGNORECASE)
+            if m:
+                level = int(m.group(2))
+                self._state.setdefault(m.group(1), {}).update(
+                    brightness_raw=level, v=level, is_on=level > 0
+                )
+                self.async_set_updated_data(dict(self._state))
+                return
+            # HSV,H.S.V
+            m = re.match(
+                r"^#(.+?)\.LED=HSV,(\d+)\.(\d+)\.(\d+)(?:\([^)]*\))?$",
+                line, re.IGNORECASE,
+            )
+            if m:
+                v = int(m.group(4))
+                self._state.setdefault(m.group(1), {}).update(
+                    h=int(m.group(2)), s=int(m.group(3)), v=v, is_on=v > 0
+                )
+                self.async_set_updated_data(dict(self._state))
+                return
+            # CCT,XXXX (Kelvin)
+            m = re.match(r"^#(.+?)\.LED=CCT,(\d+)(?:\([^)]*\))?$", line, re.IGNORECASE)
+            if m:
+                self._state.setdefault(m.group(1), {}).update(
+                    cct=int(m.group(2)), is_on=True
+                )
                 self.async_set_updated_data(dict(self._state))
                 return
             return  # ignore all other # echoes
@@ -426,10 +456,12 @@ class ENodeCoordinator(DataUpdateCoordinator):
         if not self.client.is_connected:
             raise UpdateFailed("e-Node not connected")
 
-        # Filter to pollable devices (skip DALI — it only supports NOTIFY)
+        # Skip DMX and DALI — both crash or misbehave under individual polling.
+        # CS-Bus devices with NOTIFY don't need polling either, but it serves
+        # as a useful fallback for devices that missed a NOTIFY push.
         pollable = [
             d for d in self.devices
-            if d.get("bus_type", "I") != BUS_DALI
+            if d.get("bus_type", "I") not in (BUS_DALI, BUS_DMX)
         ]
 
         if not pollable:
