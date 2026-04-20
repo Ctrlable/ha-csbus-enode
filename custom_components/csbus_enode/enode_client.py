@@ -59,6 +59,9 @@ COMMAND_TIMEOUT  = 5.0
 KEEPALIVE_INTERVAL = 30.0
 # DALI buses are slow to enumerate — give plenty of time
 DISCOVER_TIMEOUT = 25.0
+# After !DONE the e-Node auto-dumps DALI fixture config (one packet per fixture).
+# Keep the listener alive this long after !DONE to catch all of it.
+DALI_POST_DONE_TIMEOUT = 5.0
 RECONNECT_DELAY  = 10.0
 
 # Bus type constants (FORM field position 1)
@@ -367,7 +370,7 @@ class ENodeClient:
 
             # !UID300.A.ALIAS=SCREEN  (motor channel alias A-D)
             # !UID101.1.ALIAS=Fixture 1  (DALI fixture alias, numeric index)
-            m = re.match(r"^!UID(\w+)\.([A-D]|\d+)\.ALIAS=(.+)$", line, re.IGNORECASE)
+            m = re.match(r"^!UID(\w+)\.([A-Z]|\d+)\.ALIAS=(.+)$", line, re.IGNORECASE)
             if m:
                 d = devices_raw.setdefault(m.group(1), {"uid": m.group(1)})
                 d.setdefault("channel_aliases", {})[m.group(2).upper()] = m.group(3).strip()
@@ -375,7 +378,7 @@ class ENodeClient:
 
             # !UID300.A.BUS.ADDRESS=1.1.1  (motor channel address A-D)
             # !UID101.1.BUS.ADDRESS=2.1.1  (DALI fixture address, numeric index)
-            m = re.match(r"^!UID(\w+)\.([A-D]|\d+)\.BUS\.ADDRESS=(.+)$", line, re.IGNORECASE)
+            m = re.match(r"^!UID(\w+)\.([A-Z]|\d+)\.BUS\.ADDRESS=(.+)$", line, re.IGNORECASE)
             if m:
                 d = devices_raw.setdefault(m.group(1), {"uid": m.group(1)})
                 d.setdefault("channel_addresses", {})[m.group(2).upper()] = m.group(3).strip()
@@ -400,6 +403,16 @@ class ENodeClient:
                 done_event.set()
                 return
 
+            # Post-!DONE DALI fixture data:
+            # !UID1.A.DALI.SHORT=1  (DALI short address → ZGN node offset)
+            # The e-Node auto-sends this block for every configured DALI fixture
+            # after the main !DONE line. Channel key is a letter (A, B, C...).
+            m = re.match(r"^!UID(\w+)\.([A-Z])\.DALI\.SHORT=(\d+)$", line, re.IGNORECASE)
+            if m:
+                d = devices_raw.setdefault(m.group(1), {"uid": m.group(1)})
+                d.setdefault("dali_short", {})[m.group(2).upper()] = int(m.group(3))
+                return
+
         remove = self.add_listener(_on_msg)
         try:
             await self._send_raw(">DISCOVER\r\n")
@@ -410,8 +423,41 @@ class ENodeClient:
                     "DISCOVER: no !DONE after %ss — using %d device(s) so far",
                     DISCOVER_TIMEOUT, len(devices_raw),
                 )
+            # After !DONE the e-Node sends DALI fixture config as a separate
+            # burst of messages.  Keep the listener open briefly to capture them.
+            if done_event.is_set():
+                await asyncio.sleep(DALI_POST_DONE_TIMEOUT)
         finally:
             remove()
+
+        # Link DALI fixture UIDs (those with dali_short but no BUS.ADDRESS) to
+        # the ILC-DALI controller discovered earlier (the CS-Bus device at ZGN
+        # node=0 that has CCT range info).  Generate channel addresses from the
+        # controller's zone.group + each fixture's DALI short address.
+        _ctrl = next(
+            (d for d in devices_raw.values()
+             if d.get("address", "").rsplit(".", 1)[-1] == "0"
+             and (d.get("cct_warm") or d.get("cct_cool"))),
+            None,
+        )
+        if _ctrl:
+            _ctrl_zg = ".".join(_ctrl["address"].split(".")[:2])  # e.g. "1.16"
+            for d in devices_raw.values():
+                if d.get("dali_short") and not d.get("address") and not d.get("channel_addresses"):
+                    ch_addrs = {
+                        ch: f"{_ctrl_zg}.{short}"
+                        for ch, short in d["dali_short"].items()
+                    }
+                    if ch_addrs:
+                        d["channel_addresses"] = ch_addrs
+                        # DALI Tunable White — use controller's CCT range
+                        d.setdefault("form", "0,D,LIGHT,MONO,TRUE")
+                        d.setdefault("cct_warm", _ctrl.get("cct_warm", 1800))
+                        d.setdefault("cct_cool", _ctrl.get("cct_cool", 4000))
+                        _LOGGER.debug(
+                            "DALI UID%s: linked %d fixture(s) to controller %s",
+                            d["uid"], len(ch_addrs), _ctrl["address"],
+                        )
 
         result = [
             nd for d in devices_raw.values()

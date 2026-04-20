@@ -116,13 +116,18 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # DMX is excluded — NOTIFY causes a 44 Hz flood that crashes the firmware.
     # DALI is excluded — NOTIFY is not supported by ILC-DALI firmware.
     bus_types = {d.get("bus_type", "I") for d in devices}
-    if bus_types == {BUS_CSBUS}:
+    # Enable NOTIFY for CS-Bus gateways (and CS-Bus+DALI combos — the ILC-DALI
+    # controller is a CS-Bus device and benefits from NOTIFY).
+    # Disable for any gateway with DMX (bus=X) or unknown (bus=F) devices:
+    # those buses crash if flooded at 44 Hz.
+    _unsafe_buses = {BUS_DMX, "F"}
+    if not any(d.get("bus_type", BUS_CSBUS) in _unsafe_buses for d in devices):
         await client.async_enable_notify()
         _LOGGER.debug("e-Node %s: wildcard NOTIFY enabled (CS-Bus gateway)", host)
     else:
         await client.async_disable_notify()
         _LOGGER.debug(
-            "e-Node %s: NOTIFY disabled (non-CS-Bus gateway, bus types: %s)",
+            "e-Node %s: NOTIFY disabled (DMX/unknown bus present: %s)",
             host, bus_types,
         )
 
