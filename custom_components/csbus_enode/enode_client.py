@@ -353,15 +353,17 @@ class ENodeClient:
                 devices_raw.setdefault(m.group(1), {"uid": m.group(1)})["address"] = m.group(2).strip()
                 return
 
-            # !UID300.A.ALIAS=SCREEN  (motor channel alias)
-            m = re.match(r"^!UID(\w+)\.([A-D])\.ALIAS=(.+)$", line, re.IGNORECASE)
+            # !UID300.A.ALIAS=SCREEN  (motor channel alias A-D)
+            # !UID101.1.ALIAS=Fixture 1  (DALI fixture alias, numeric index)
+            m = re.match(r"^!UID(\w+)\.([A-D]|\d+)\.ALIAS=(.+)$", line, re.IGNORECASE)
             if m:
                 d = devices_raw.setdefault(m.group(1), {"uid": m.group(1)})
                 d.setdefault("channel_aliases", {})[m.group(2).upper()] = m.group(3).strip()
                 return
 
-            # !UID300.A.BUS.ADDRESS=1.1.1  (motor channel address)
-            m = re.match(r"^!UID(\w+)\.([A-D])\.BUS\.ADDRESS=(.+)$", line, re.IGNORECASE)
+            # !UID300.A.BUS.ADDRESS=1.1.1  (motor channel address A-D)
+            # !UID101.1.BUS.ADDRESS=2.1.1  (DALI fixture address, numeric index)
+            m = re.match(r"^!UID(\w+)\.([A-D]|\d+)\.BUS\.ADDRESS=(.+)$", line, re.IGNORECASE)
             if m:
                 d = devices_raw.setdefault(m.group(1), {"uid": m.group(1)})
                 d.setdefault("channel_addresses", {})[m.group(2).upper()] = m.group(3).strip()
@@ -705,5 +707,22 @@ def _normalise_device(raw: dict[str, Any]) -> dict[str, Any]:
     if raw.get("channel_addresses"):
         desc["channel_addresses"] = raw["channel_addresses"]
         desc["channel_aliases"]   = raw.get("channel_aliases", {})
+
+    elif form["bus_type"] == BUS_DALI and form["channels"] > 0:
+        # DALI fallback: DISCOVER didn't return per-fixture !UID.N.BUS.ADDRESS lines.
+        # Generate fixture addresses from the base ZGN + DALI short address (1-based).
+        # e.g. controller at 2.1.1 with 16 fixtures → 2.1.1 … 2.1.16
+        parts = address.split(".")
+        if len(parts) == 3:
+            z, g = parts[0], parts[1]
+            ch_addrs = {str(i): f"{z}.{g}.{i}" for i in range(1, form["channels"] + 1)}
+            ch_aliases = raw.get("channel_aliases", {})
+            desc["channel_addresses"] = ch_addrs
+            desc["channel_aliases"]   = ch_aliases
+            _LOGGER.debug(
+                "DALI UID%s: no per-fixture addresses in DISCOVER — "
+                "generated %d address(es) from base %s (channels=%d)",
+                uid, form["channels"], address, form["channels"],
+            )
 
     return desc
