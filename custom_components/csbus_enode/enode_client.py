@@ -191,6 +191,18 @@ class ENodeClient:
         await self._send_raw("#0.0.0.LED.NOTIFY=VALUE;\r\n")
         await self._send_raw("#0.0.0.MOTOR.NOTIFY=ON;\r\n")
 
+    async def async_disable_notify(self) -> None:
+        """
+        Explicitly disable NOTIFY push for non-CS-Bus gateways.
+
+        Sends NOTIFY=NONE/OFF to cancel any NOTIFY that may have been left
+        active by an older HA session (before the DMX guard was added).
+        A leftover active NOTIFY on a DMX gateway causes a 44 Hz push flood
+        that eventually crashes the e-Node firmware.
+        """
+        await self._send_raw("#0.0.0.LED.NOTIFY=NONE;\r\n")
+        await self._send_raw("#0.0.0.MOTOR.NOTIFY=OFF;\r\n")
+
     async def async_connect(self) -> bool:
         """Open Telnet connection and authenticate. Returns True on success."""
         # Prevent re-entrant connects
@@ -647,23 +659,30 @@ def _normalise_device(raw: dict[str, Any]) -> dict[str, Any]:
     """
     uid       = str(raw.get("uid", ""))
     alias     = str(raw.get("alias", f"Device {uid}")).strip()
-    address   = str(raw.get("address", "2.1.1")).strip().rstrip(".")
     type_name = str(raw.get("type", "")).strip()
 
     # Validate ZGN address: must be Z.G.N with all-numeric parts and no octet > 99.
     # Addresses like "172.16.1" are IP address fragments from misconfigured gateways.
-    _addr_parts = address.split(".")
-    if (
-        len(_addr_parts) != 3
-        or not all(p.isdigit() for p in _addr_parts)
-        or any(int(p) > 99 for p in _addr_parts)
-    ):
-        _LOGGER.warning(
-            "DISCOVER: UID%s has invalid ZGN address %r — "
-            "looks like an IP address fragment. Skipping device.",
-            uid, address,
-        )
-        return None
+    # Devices with no BUS.ADDRESS at all are accepted only if channel_addresses will
+    # provide per-entity addresses (e.g. IMC-300 multi-channel motor).
+    _raw_address = raw.get("address")
+    if _raw_address is None:
+        # No BUS.ADDRESS in DISCOVER response — only keep if channel addresses exist
+        address = ""
+    else:
+        address = str(_raw_address).strip().rstrip(".")
+        _addr_parts = address.split(".")
+        if (
+            len(_addr_parts) != 3
+            or not all(p.isdigit() for p in _addr_parts)
+            or any(int(p) > 99 for p in _addr_parts)
+        ):
+            _LOGGER.warning(
+                "DISCOVER: UID%s has invalid ZGN address %r — "
+                "looks like an IP address fragment. Skipping device.",
+                uid, address,
+            )
+            return None
 
     form_str = raw.get("form", "")
     if form_str:
@@ -741,5 +760,14 @@ def _normalise_device(raw: dict[str, Any]) -> dict[str, Any]:
                 "generated %d address(es) from base %s (channels=%d)",
                 uid, form["channels"], address, form["channels"],
             )
+
+    # If there was no BUS.ADDRESS and no valid channel addresses were produced,
+    # the device has no addressable entities — discard it.
+    if not address and not desc.get("channel_addresses"):
+        _LOGGER.debug(
+            "DISCOVER: UID%s has no BUS.ADDRESS and no valid channel addresses — skipping",
+            uid,
+        )
+        return None
 
     return desc

@@ -120,8 +120,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         await client.async_enable_notify()
         _LOGGER.debug("e-Node %s: wildcard NOTIFY enabled (CS-Bus gateway)", host)
     else:
+        await client.async_disable_notify()
         _LOGGER.debug(
-            "e-Node %s: NOTIFY skipped — bus types present: %s",
+            "e-Node %s: NOTIFY disabled (non-CS-Bus gateway, bus types: %s)",
             host, bus_types,
         )
 
