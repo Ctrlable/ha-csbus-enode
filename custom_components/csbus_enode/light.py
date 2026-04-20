@@ -79,9 +79,11 @@ from homeassistant.components.light import (
     LightEntityFeature,
 )
 from homeassistant.config_entries import ConfigEntry
+from homeassistant.const import STATE_ON, STATE_UNAVAILABLE, STATE_UNKNOWN
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.restore_state import RestoreEntity
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import CS_DEVICE_LED, DATA_CLIENT, DATA_COORDINATOR, DATA_DEVICES, DOMAIN, PLATFORM_LIGHT
@@ -137,7 +139,7 @@ async def async_setup_entry(
     async_add_entities(lights)
 
 
-class CSBusLight(CoordinatorEntity, LightEntity):
+class CSBusLight(CoordinatorEntity, LightEntity, RestoreEntity):
     """
     One CS-Bus / DMX / DALI light controller channel.
 
@@ -220,6 +222,39 @@ class CSBusLight(CoordinatorEntity, LightEntity):
                 del self._opt_state[key]
 
         super()._handle_coordinator_update()
+
+    # ------------------------------------------------------------------
+    # State restoration (survives HA restarts)
+    # ------------------------------------------------------------------
+
+    async def async_added_to_hass(self) -> None:
+        """Restore last known state so entities don't show Unknown after restart."""
+        await super().async_added_to_hass()
+        last_state = await self.async_get_last_state()
+        if not last_state or last_state.state in (STATE_UNAVAILABLE, STATE_UNKNOWN):
+            return
+        attrs = last_state.attributes
+        restored: dict[str, Any] = {"is_on": last_state.state == STATE_ON}
+        if ATTR_BRIGHTNESS in attrs:
+            raw = round(int(attrs[ATTR_BRIGHTNESS]) * CS_MAX / HA_MAX)
+            restored["brightness_raw"] = raw
+            restored["v"] = raw
+        if ATTR_HS_COLOR in attrs:
+            h_deg, s_pct = attrs[ATTR_HS_COLOR]
+            restored["h"] = round(float(h_deg) * CS_MAX / 360)
+            restored["s"] = round(float(s_pct) * CS_MAX / 100)
+        if ATTR_COLOR_TEMP_KELVIN in attrs:
+            restored["cct"] = int(attrs[ATTR_COLOR_TEMP_KELVIN])
+        color_mode = attrs.get("color_mode")
+        if color_mode == ColorMode.COLOR_TEMP:
+            self._last_mode = _MODE_CCT
+        elif color_mode == ColorMode.HS:
+            self._last_mode = _MODE_COLOR
+        self._opt_state = restored
+        _LOGGER.debug(
+            "Restored last state for %s: is_on=%s color_mode=%s",
+            self._attr_name, restored.get("is_on"), color_mode,
+        )
 
     # ------------------------------------------------------------------
     # Device info
