@@ -243,7 +243,7 @@ class CSBusLight(CoordinatorEntity, LightEntity, RestoreEntity):
             h_deg, s_pct = attrs[ATTR_HS_COLOR]
             restored["h"] = round(float(h_deg) * CS_MAX / 360)
             restored["s"] = round(float(s_pct) * CS_MAX / 100)
-        if ATTR_COLOR_TEMP_KELVIN in attrs:
+        if ATTR_COLOR_TEMP_KELVIN in attrs and attrs[ATTR_COLOR_TEMP_KELVIN] is not None:
             restored["cct"] = int(attrs[ATTR_COLOR_TEMP_KELVIN])
         color_mode = attrs.get("color_mode")
         if color_mode == ColorMode.COLOR_TEMP:
