@@ -136,10 +136,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # Register NOTIFY listener — all state updates arrive here for free
     remove_listener = client.add_listener(coordinator.handle_notify)
 
-    # Query every CS-Bus device once at startup so entities have real state
-    # immediately after HA restarts instead of waiting for staggered polls.
-    await coordinator.async_initial_refresh()
-
     hass.data.setdefault(DOMAIN, {})
     hass.data[DOMAIN][entry.entry_id] = {
         DATA_CLIENT: client,
@@ -497,73 +493,6 @@ class ENodeCoordinator(DataUpdateCoordinator):
 
         if changed:
             self.async_set_updated_data(dict(self._state))
-
-    # ------------------------------------------------------------------
-    # Startup state sweep
-    # ------------------------------------------------------------------
-
-    async def async_initial_refresh(self) -> None:
-        """Query every CS-Bus device once at startup to populate initial state.
-
-        Called once from async_setup_entry after NOTIFY is enabled.
-        DMX/DALI and unknown bus types are skipped — same rule as polling.
-        A 0.15 s gap between devices avoids flooding the gateway.
-        """
-        pollable = [
-            d for d in self.devices
-            if d.get("bus_type", BUS_CSBUS) == BUS_CSBUS
-        ]
-        if not pollable:
-            return
-        _LOGGER.debug(
-            "e-Node %s: initial state sweep for %d CS-Bus device(s)",
-            self.client.host, len(pollable),
-        )
-        changed = False
-        for dev in pollable:
-            addr = dev["address"]
-            try:
-                state = self._state.setdefault(addr, {})
-                if dev["platform"] == PLATFORM_LIGHT:
-                    color_space = dev.get("color_space", "MONO")
-                    if color_space == "HSV":
-                        val = await self.client.async_query(addr, "LED", "COLOR")
-                        if val:
-                            parts = val.rstrip(";").split(".")
-                            if len(parts) == 3:
-                                h, s, v = int(parts[0]), int(parts[1]), int(parts[2])
-                                state.update(h=h, s=s, v=v, is_on=v > 0)
-                                changed = True
-                    else:
-                        if dev.get("cct_support"):
-                            val = await self.client.async_query(addr, "LED", "STATUS")
-                            if val:
-                                parts = val.rstrip(";").split(",")
-                                if len(parts) >= 2:
-                                    state.update(sun=int(parts[0]), cct=int(parts[1]))
-                                    changed = True
-                        val = await self.client.async_query(addr, "LED", "VALUE")
-                        if val:
-                            raw = int(val.rstrip(";").split(".")[0])
-                            state.update(brightness_raw=raw, is_on=raw > 0)
-                            changed = True
-                elif dev["platform"] == PLATFORM_COVER:
-                    val = await self.client.async_query(addr, "MOTOR", "POSITION")
-                    if val:
-                        state["position"] = float(val.rstrip(";"))
-                        changed = True
-            except Exception as exc:
-                _LOGGER.debug(
-                    "Initial refresh error for %s (%s): %s",
-                    dev.get("alias"), addr, exc,
-                )
-            await asyncio.sleep(0.15)
-
-        if changed:
-            self.async_set_updated_data(dict(self._state))
-            _LOGGER.debug(
-                "e-Node %s: initial state sweep complete", self.client.host
-            )
 
     # ------------------------------------------------------------------
     # Staggered polling fallback

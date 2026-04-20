@@ -25,10 +25,13 @@ from homeassistant.components.cover import (
     CoverEntity,
     CoverEntityFeature,
 )
+from homeassistant.components.cover import ATTR_CURRENT_POSITION
 from homeassistant.config_entries import ConfigEntry
+from homeassistant.const import STATE_UNAVAILABLE, STATE_UNKNOWN
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.restore_state import RestoreEntity
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import (
@@ -77,7 +80,7 @@ async def async_setup_entry(
     async_add_entities(covers)
 
 
-class CSBusCover(CoordinatorEntity, CoverEntity):
+class CSBusCover(CoordinatorEntity, CoverEntity, RestoreEntity):
     """Represents a CS-Bus IMC motor controller channel."""
 
     _attr_device_class = CoverDeviceClass.SHADE
@@ -111,6 +114,20 @@ class CSBusCover(CoordinatorEntity, CoverEntity):
             manufacturer="Converging Systems",
             model=self._device.get("type_name", "IMC"),
         )
+
+    # ------------------------------------------------------------------
+    # State restoration
+    # ------------------------------------------------------------------
+
+    async def async_added_to_hass(self) -> None:
+        await super().async_added_to_hass()
+        last_state = await self.async_get_last_state()
+        if not last_state or last_state.state in (STATE_UNAVAILABLE, STATE_UNKNOWN):
+            return
+        attrs = last_state.attributes
+        if ATTR_CURRENT_POSITION in attrs:
+            ha_pos = int(attrs[ATTR_CURRENT_POSITION])
+            self.coordinator._state.setdefault(self._address, {})["position"] = _ha_pos_to_cs(ha_pos)
 
     # ------------------------------------------------------------------
     # State
