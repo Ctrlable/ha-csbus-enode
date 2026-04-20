@@ -701,12 +701,29 @@ def _normalise_device(raw: dict[str, Any]) -> dict[str, Any]:
         "type_name":    type_name or f"e-Node/{form['bus_type']}",
     }
 
-    # Preserve per-channel address map for any multi-channel device:
-    # IMC-300 motors (A/B/C/D channels) and ILC-DALI multi-channel lights both
-    # use the same !UID.X.BUS.ADDRESS pattern — expand whichever has channels.
+    # Preserve per-channel address map for any multi-channel device.
+    # Validate each channel address with the same ZGN rule as the main address
+    # so IP-address fragments (e.g. 172.16.1) don't leak through as entities.
     if raw.get("channel_addresses"):
-        desc["channel_addresses"] = raw["channel_addresses"]
-        desc["channel_aliases"]   = raw.get("channel_aliases", {})
+        raw_aliases = raw.get("channel_aliases", {})
+        valid_ch: dict[str, str] = {}
+        valid_al: dict[str, str] = {}
+        for ch, ch_addr in raw["channel_addresses"].items():
+            parts = ch_addr.split(".")
+            if (len(parts) == 3
+                    and all(p.isdigit() for p in parts)
+                    and all(int(p) <= 99 for p in parts)):
+                valid_ch[ch] = ch_addr
+                if ch in raw_aliases:
+                    valid_al[ch] = raw_aliases[ch]
+            else:
+                _LOGGER.warning(
+                    "DISCOVER: UID%s channel %s address %r is not a valid ZGN — skipping",
+                    uid, ch, ch_addr,
+                )
+        if valid_ch:
+            desc["channel_addresses"] = valid_ch
+            desc["channel_aliases"]   = valid_al
 
     elif form["bus_type"] == BUS_DALI and form["channels"] > 0:
         # DALI fallback: DISCOVER didn't return per-fixture !UID.N.BUS.ADDRESS lines.

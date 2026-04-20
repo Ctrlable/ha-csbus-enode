@@ -508,20 +508,23 @@ class ENodeCoordinator(DataUpdateCoordinator):
         if not self.client.is_connected:
             raise UpdateFailed("e-Node not connected")
 
-        # Only poll CS-Bus (I) devices — DMX/DALI crash or misbehave under
-        # individual polling, and any unknown bus type is also excluded since
-        # queries to unknown buses time out and may destabilise the gateway.
-        pollable = [
-            d for d in self.devices
-            if d.get("bus_type", BUS_CSBUS) == BUS_CSBUS
-        ]
-        skipped = [
-            d for d in self.devices
-            if d.get("bus_type", BUS_CSBUS) != BUS_CSBUS
-        ]
+        def _is_pollable(d: dict) -> bool:
+            if d.get("bus_type", BUS_CSBUS) != BUS_CSBUS:
+                return False
+            # ZGN node=0 addresses are bus controller addresses, not pollable fixtures.
+            # Querying them times out and eventually causes the gateway to drop the connection.
+            parts = d.get("address", "").split(".")
+            if len(parts) == 3 and parts[2] == "0":
+                return False
+            return True
+
+        # Only poll CS-Bus (I) devices with a non-zero ZGN node.
+        # DMX/DALI/unknown buses crash or misbehave; node=0 are controllers, not fixtures.
+        pollable = [d for d in self.devices if _is_pollable(d)]
+        skipped  = [d for d in self.devices if not _is_pollable(d)]
         if skipped:
             _LOGGER.debug(
-                "Polling: skipping %d non-CS-Bus device(s): %s",
+                "Polling: skipping %d device(s): %s",
                 len(skipped),
                 [f"{d['address']}(bus={d.get('bus_type','?')})" for d in skipped],
             )
