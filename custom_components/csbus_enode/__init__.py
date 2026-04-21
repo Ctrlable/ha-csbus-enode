@@ -118,16 +118,19 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     bus_types = {d.get("bus_type", "I") for d in devices}
     # Enable NOTIFY for CS-Bus gateways (and CS-Bus+DALI combos — the ILC-DALI
     # controller is a CS-Bus device and benefits from NOTIFY).
-    # Disable for any gateway with DMX (bus=X) or unknown (bus=F) devices:
-    # those buses crash if flooded at 44 Hz.
+    # Do NOT send ANY wildcard command to DMX (bus=X) or unknown (bus=F) gateways:
+    # #0.0.0.* commands force the e-Node to touch all connected devices simultaneously
+    # which overwhelms the internal bus and crashes DMX firmware.
     _unsafe_buses = {BUS_DMX, "F"}
     if not any(d.get("bus_type", BUS_CSBUS) in _unsafe_buses for d in devices):
         await client.async_enable_notify()
         _LOGGER.debug("e-Node %s: wildcard NOTIFY enabled (CS-Bus gateway)", host)
     else:
-        await client.async_disable_notify()
+        # Do NOT call async_disable_notify() here — sending #0.0.0.LED.NOTIFY=NONE
+        # to a DMX gateway triggers a bus-wide broadcast that crashes the firmware.
+        # NOTIFY is never enabled for DMX gateways so no cleanup is needed.
         _LOGGER.debug(
-            "e-Node %s: NOTIFY disabled (DMX/unknown bus present: %s)",
+            "e-Node %s: skipping NOTIFY setup (DMX/unknown bus present: %s)",
             host, bus_types,
         )
 
@@ -151,6 +154,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     }
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+
+    # For gateways without wildcard NOTIFY (DMX/unknown buses), do a one-shot
+    # startup poll of every device so entities show real state immediately
+    # rather than "Unknown" until the first scheduled poll cycle.
+    if any(d.get("bus_type", BUS_CSBUS) in _unsafe_buses for d in devices):
+        hass.async_create_task(coordinator.async_startup_poll())
+
     entry.async_on_unload(entry.add_update_listener(_async_update_options))
     return True
 
@@ -418,7 +428,7 @@ class ENodeCoordinator(DataUpdateCoordinator):
                 addr = m.group(1)
                 self._state.setdefault(addr, {})["is_on"] = True
                 dev = next((d for d in self.devices if d["address"] == addr), None)
-                if dev and dev.get("bus_type", BUS_CSBUS) not in (BUS_DALI, BUS_DMX):
+                if dev and dev.get("bus_type", BUS_CSBUS) == BUS_CSBUS:
                     asyncio.ensure_future(self._async_fetch_state_after_recall(addr, dev))
                 self.async_set_updated_data(dict(self._state))
                 return
@@ -499,6 +509,77 @@ class ENodeCoordinator(DataUpdateCoordinator):
 
         if changed:
             self.async_set_updated_data(dict(self._state))
+
+    # ------------------------------------------------------------------
+    # One-shot startup poll (DMX / non-NOTIFY gateways)
+    # ------------------------------------------------------------------
+
+    async def async_startup_poll(self) -> None:
+        """Query every device once at startup to populate initial state.
+
+        Called only for gateways without wildcard NOTIFY (e.g. DMX) so that
+        entities show real state immediately rather than "Unknown" until the
+        first scheduled poll cycle fires.
+        """
+        await asyncio.sleep(1.0)  # let platform setup finish registering entities
+        if not self.client.is_connected:
+            return
+
+        def _pollable(d: dict) -> bool:
+            if d.get("bus_type", BUS_CSBUS) == BUS_DALI:
+                return False
+            parts = d.get("address", "").split(".")
+            if len(parts) == 3 and parts[2] == "0":
+                return False
+            return True
+
+        targets = [d for d in self.devices if _pollable(d)]
+        _LOGGER.debug("Startup poll: querying %d device(s) on %s", len(targets), self.client.host)
+
+        for dev in targets:
+            addr = dev["address"]
+            try:
+                if dev["platform"] == PLATFORM_LIGHT:
+                    if dev.get("color_space", "MONO") == "HSV":
+                        val = await self.client.async_query(addr, "LED", "COLOR")
+                        if val:
+                            parts = val.rstrip(";").split(".")
+                            if len(parts) == 3:
+                                self._state.setdefault(addr, {}).update(
+                                    h=int(parts[0]), s=int(parts[1]),
+                                    v=int(parts[2]), is_on=int(parts[2]) > 0,
+                                )
+                    else:
+                        val = await self.client.async_query(addr, "LED", "VALUE")
+                        if val:
+                            parts = val.rstrip(";").split(".")
+                            try:
+                                raw = int(parts[0])
+                                self._state.setdefault(addr, {}).update(
+                                    brightness_raw=raw, is_on=raw > 0,
+                                )
+                            except (ValueError, IndexError):
+                                pass
+                elif dev["platform"] == PLATFORM_COVER:
+                    val = await self.client.async_query(addr, "MOTOR", "POSITION")
+                    if val:
+                        try:
+                            self._state.setdefault(addr, {})["position"] = float(val.rstrip(";"))
+                        except ValueError:
+                            pass
+            except Exception as exc:
+                _LOGGER.debug(
+                    "Startup poll error for %s (%s): %s",
+                    dev.get("alias"), addr, exc,
+                )
+            await asyncio.sleep(POLL_STAGGER_DELAY)
+
+        if self._state:
+            self.async_set_updated_data(dict(self._state))
+            _LOGGER.debug(
+                "Startup poll complete: %d device(s) have state on %s",
+                len(self._state), self.client.host,
+            )
 
     # ------------------------------------------------------------------
     # Staggered polling fallback
